@@ -40,8 +40,8 @@
 #include <Adafruit_NeoPixel.h>
 
 // ── Wi-Fi Credentials ────────────────────────────────────────────────────────
-const char* ssid     = "CIREG";            // <-- Set your Wi-Fi SSID
-const char* password = "walongone...";       // <-- Set your Wi-Fi Password
+const char* ssid     = "Hi";            // <-- 2.4G Wi-Fi SSID
+const char* password = "estogs000";     // <-- 2.4G Wi-Fi Password
 const char* hostName = "dispenser-drawer2"; // mDNS: http://dispenser-drawer2.local
 
 // ── LED Strip Configuration ──────────────────────────────────────────────────

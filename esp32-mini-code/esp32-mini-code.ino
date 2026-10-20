@@ -21,9 +21,8 @@
 // ==============================================================================
 
 // ── Wi-Fi Configuration ──────────────────────────────────────────────────────
-const char* ssid     = "CIREG";            // <-- Your 2.4G Wi-Fi SSID
-const char* password = "walongone...";      // <-- Your Wi-Fi password
-const char* ap_ssid  = "Smart-Dispenser-Setup";
+const char* ssid     = "Hi";            // <-- 2.4G Wi-Fi SSID
+const char* password = "estogs000";     // <-- 2.4G Wi-Fi password
 
 // ── NTP & Timezone Configuration ─────────────────────────────────────────────
 // Default timezone: GMT+8 (Philippines / Asia/Manila)
@@ -32,9 +31,10 @@ int daylightOffset_sec = 0;
 const char* ntpServer1 = "pool.ntp.org";
 const char* ntpServer2 = "time.nist.gov";
 
-// ── Drawer ESP Hostnames / Endpoints ─────────────────────────────────────────
+// ── Drawer ESP & Arduino Hostnames / Endpoints ───────────────────────────────
 const char* DRAWER1_HOST = "http://dispenser-drawer1.local";
 const char* DRAWER2_HOST = "http://dispenser-drawer2.local";
+const char* ARDUINO_HOST = "http://10.146.105.91";
 
 // ── Pin Configuration ────────────────────────────────────────────────────────
 #if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(ARDUINO_ESP32C3_DEV) || defined(ARDUINO_ESP32C3)
@@ -222,8 +222,8 @@ void triggerDispenseRelay(int relayNum) {
   if (pin >= 0) {
     digitalWrite(pin, RELAY_ON);
     activeDispensePin = pin;
-    dispenseEndTime = millis() + 2000; // 2-second pulse
-    Serial.printf("[DISPENSE] Relay %d (Pin %d) ON\n", relayNum, pin);
+    dispenseEndTime = millis() + 5000; // 5-second pulse
+    Serial.printf("[DISPENSE] Relay %d (Pin %d) ON for 5s\n", relayNum, pin);
   }
 
   // Also bridge command to Arduino via Serial
@@ -289,6 +289,35 @@ void notifyDrawerLED(int drawer, int slot, const String& action) {
     HTTPClient http;
     http.begin(targetUrl);
     http.setTimeout(1200); // 1.2s timeout
+    http.GET();
+    http.end();
+  }
+}
+
+// ── Notify Arduino Controller over Serial & Wi-Fi ─────────────────────────────
+void notifyArduinoAlert(const String& compartment, int drawer = 1) {
+  // 1. Output to Serial for wired UART bridge
+  Serial.printf("ALERT:%s\n", compartment.c_str());
+
+  // 2. Also send HTTP command to Arduino over Wi-Fi
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String encComp = compartment;
+    encComp.replace(' ', '+');
+    String url = String(ARDUINO_HOST) + "/alert?compartment=" + encComp + "&drawer=" + String(drawer);
+    http.begin(url);
+    http.setTimeout(1500);
+    http.GET();
+    http.end();
+  }
+}
+
+void notifyArduinoStop() {
+  Serial.println("STOP");
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(String(ARDUINO_HOST) + "/stop-vibrate");
+    http.setTimeout(1500);
     http.GET();
     http.end();
   }
@@ -459,9 +488,9 @@ void checkAlarms() {
         int drawer = (schedules[i].slotIndex >= 21) ? 2 : 1;
         notifyDrawerLED(drawer, schedules[i].slotIndex, "alert");
 
-        // 4. Trigger Hardware Relay & Arduino LCD
+        // 4. Trigger Hardware Relay & Arduino Buzzer/LCD (via Wi-Fi & Serial)
         triggerDispenseRelay(currentAlert.relayNum);
-        Serial.printf("ALERT:%s\n", schedules[i].compartment);
+        notifyArduinoAlert(schedules[i].compartment, drawer);
 
         // One-time schedule is marked inactive after firing
         if (strlen(schedules[i].date) > 0) {
@@ -564,8 +593,8 @@ void handleStopVibrate() {
     int drawer = (currentAlert.slotIndex >= 21) ? 2 : 1;
     notifyDrawerLED(drawer, currentAlert.slotIndex, "clear-alert");
 
-    // Signal Arduino
-    Serial.printf("TAKEN:%s\n", currentAlert.compartment);
+    // Signal Arduino over Serial & Wi-Fi
+    notifyArduinoStop();
 
     currentAlert.isAlerting = false;
     server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"stopped\",\"marked_status\":\"TAKEN\",\"elapsed_seconds\":" + String(elapsed) + "}");
@@ -717,8 +746,14 @@ void handleRoot() {
 // ── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-  Serial.println("\n[BOOT] Starting Smart Medicine Dispenser Master Controller...");
+  unsigned long serialWait = millis();
+  while (!Serial && (millis() - serialWait < 2500)) {
+    delay(50);
+  }
+  delay(500);
+  Serial.println("\n========================================================");
+  Serial.println("  SMART MEDICINE DISPENSER - ESP32 MASTER CONTROLLER");
+  Serial.println("========================================================");
 
   // Setup Vibration Motor Pin
   pinMode(VIBRATION_PIN, OUTPUT);
@@ -741,27 +776,30 @@ void setup() {
   // Quick initial vibration self-test (100ms)
   startVibrationAlert(1, 100, 50);
 
-  // Start Wi-Fi
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(ap_ssid);
+  // Start Wi-Fi in pure Station Mode (Direct connection to router, No Hotspot)
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid, password);
+  Serial.printf("\n[WIFI] Connecting directly to '%s'...\n", ssid);
 
   int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 25) {
+  while (WiFi.status() != WL_CONNECTED && retries < 40) {
     delay(500);
     Serial.print(".");
     retries++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\n[WIFI] Connected! IP Address: %s\n", WiFi.localIP().toString().c_str());
+    String localIPStr = WiFi.localIP().toString();
+    Serial.printf("\n[WIFI] Connected! IP Address: %s\n", localIPStr.c_str());
+    Serial.printf("IP:%s\n", localIPStr.c_str()); // Sent to Arduino to display on 16x2 LCD
     if (MDNS.begin("dispenser")) {
       Serial.println("[MDNS] Started: http://dispenser.local");
     }
     // NTP Time Sync
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2);
   } else {
-    Serial.printf("\n[WIFI] Running in AP Mode: SSID '%s' (http://192.168.4.1)\n", ap_ssid);
+    Serial.printf("\n[WIFI] ⚠️ Still attempting connection to '%s' in background...\n", ssid);
   }
 
   // Setup Web Server Endpoints
@@ -787,10 +825,57 @@ void setup() {
   Serial.println("[HTTP] Server listening on port 80");
 }
 
+// ── Handle Serial Messages from Arduino or Serial Monitor ───────────────────
+void handleSerialFromArduino() {
+  if (Serial.available() > 0) {
+    String msg = Serial.readStringUntil('\n');
+    msg.trim();
+    if (msg.startsWith("TAKEN:")) {
+      String comp = msg.substring(6);
+      Serial.printf("[SERIAL <- ARDUINO] Magnetic Reed Switch Triggered! Dose TAKEN for: %s\n", comp.c_str());
+      handleStopVibrate(); // Marks dose TAKEN, stops vibration, clears LED, logs event!
+    } else if (msg.startsWith("MISSED:")) {
+      Serial.println("[SERIAL <- ARDUINO] 20-Minute Grace Period Expired: MISSED");
+    } else if (msg.equalsIgnoreCase("IP") || msg.equalsIgnoreCase("STATUS") || msg.equalsIgnoreCase("WIFI")) {
+      Serial.println("\n============== ESP32-MINI STATUS ==============");
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("  Wi-Fi Network : %s\n", ssid);
+        Serial.printf("  IP Address    : %s\n", WiFi.localIP().toString().c_str());
+        Serial.printf("  Gateway URL   : http://%s/\n", WiFi.localIP().toString().c_str());
+        Serial.println("  mDNS Address  : http://dispenser.local/");
+      } else {
+        Serial.printf("  Wi-Fi Status  : DISCONNECTED (Connecting to '%s'...)\n", ssid);
+      }
+      Serial.printf("  Vibration Pin : GPIO %d (%s)\n", VIBRATION_PIN, isVibrating ? "VIBRATING" : "IDLE");
+      Serial.printf("  Schedules     : %d active in memory\n", scheduleCount);
+      Serial.println("================================================\n");
+    } else if (msg.equalsIgnoreCase("VIBRATE")) {
+      Serial.println("[TEST] Triggering 3 vibration pulses on GPIO 4...");
+      startVibrationAlert(3, 600, 300);
+    } else if (msg.equalsIgnoreCase("STOP")) {
+      Serial.println("[TEST] Stopping vibration.");
+      stopVibration();
+    }
+  }
+}
+
 // ── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
   server.handleClient();
   updateVibrationState();
   updateDispenserState();
   checkAlarms();
+  handleSerialFromArduino();
+
+  // Periodic heartbeat every 5 seconds so IP is always visible in Serial Monitor
+  static unsigned long lastHeartbeat = 0;
+  if (millis() - lastHeartbeat >= 5000) {
+    lastHeartbeat = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("[ESP32-MINI] 🟢 IP: %s | http://%s | Vibration: GPIO %d\n",
+                    WiFi.localIP().toString().c_str(), WiFi.localIP().toString().c_str(), VIBRATION_PIN);
+    } else {
+      Serial.printf("[ESP32-MINI] 🟡 Connecting to Wi-Fi '%s'...\n", ssid);
+    }
+  }
 }
