@@ -1,0 +1,146 @@
+
+#include <Arduino.h>
+#include <WiFi.h>
+
+// WIFI CONFIGURATION
+const char* ssid     = "Hi";            // <-- 2.4G Wi-Fi SSID
+const char* password = "estogs000";  
+
+// LED GPIO CONFIGURATION
+// ROW A
+const int rowA[7] = {4, 5, 6, 7, 8, 9, 10};
+
+// ROW B
+const int rowB[7] = {11, 12, 13, 14, 15, 16, 17};
+
+// ROW C
+const int rowC[7] = {18, 21, 38, 39, 40, 41, 42};
+
+const int ledPins[3][7] = {
+  {4, 5, 6, 7, 8, 9, 10},
+  {11, 12, 13, 14, 15, 16, 17},
+  {18, 21, 38, 39, 40, 41, 42}
+};
+
+// LED FUNCTIONS
+void ledOn(int row, int col) {
+  digitalWrite(ledPins[row][col], HIGH);
+}
+
+void ledOff(int row, int col) {
+  digitalWrite(ledPins[row][col], LOW);
+}
+
+void allOff() {
+  for (int r = 0; r < 3; r++) {
+    for (int c = 0; c < 7; c++) {
+      ledOff(r, c);
+    }
+  }
+}
+
+void allOn() {
+  for (int r = 0; r < 3; r++) {
+    for (int c = 0; c < 7; c++) {
+      ledOn(r, c);
+    }
+  }
+}
+
+// WIFI CONNECTION
+void connectWiFi() {
+  Serial.println();
+  Serial.println("Connecting to WiFi...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  int attempts = 0;
+
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.println("WiFi Connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Signal Strength: ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+  } else {
+    Serial.println();
+    Serial.println("WiFi connection failed.");
+    Serial.println("LED animations will continue.");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // Initialize LEDs
+  for (int r = 0; r < 3; r++) {
+    for (int c = 0; c < 7; c++) {
+      pinMode(ledPins[r][c], OUTPUT);
+      digitalWrite(ledPins[r][c], LOW);
+    }
+  }
+
+  // Connect to WiFi
+  connectWiFi();
+}
+
+void loop() {
+  // Reconnect WiFi if disconnected
+  static unsigned long lastReconnect = 0;
+
+  if (WiFi.status() != WL_CONNECTED &&
+      millis() - lastReconnect >= 10000) {
+    lastReconnect = millis();
+    WiFi.reconnect();
+  }
+
+  // ANIMATION 1: Row A
+  for (int i = 0; i < 7; i++) {
+    allOff();
+    ledOn(0, i);
+    delay(150);
+  }
+
+  // ANIMATION 2: Row B
+  for (int i = 0; i < 7; i++) {
+    allOff();
+    ledOn(1, i);
+    delay(150);
+  }
+
+  // ANIMATION 3: Row C
+  for (int i = 0; i < 7; i++) {
+    allOff();
+    ledOn(2, i);
+    delay(150);
+  }
+
+  // ANIMATION 4: Column by column
+  for (int i = 0; i < 7; i++) {
+    allOff();
+
+    ledOn(0, i);
+    ledOn(1, i);
+    ledOn(2, i);
+
+    delay(200);
+  }
+
+  // ANIMATION 5: All ON
+  allOn();
+  delay(1000);
+
+  // ANIMATION 6: All OFF
+  allOff();
+  delay(500);
+}

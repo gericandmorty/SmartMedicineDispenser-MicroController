@@ -1,387 +1,578 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+
 // ==============================================================================
-//  SMART MEDICINE DISPENSER - ESP1 FIRMWARE (DRAWER 1: 21 LEDs CONTROLLER)
-// ==============================================================================
-//  Hardware Target: ESP32 or ESP8266 (NodeMCU / Wemos D1 Mini / SuperMini)
-//  Purpose:
-//    Controls the 21 compartment LEDs for Drawer 1 (Compartments A1..G3).
-//    - Slot 0..20 corresponds to:
-//        Row 1: A1 (0), B1 (1), C1 (2), D1 (3), E1 (4), F1 (5), G1 (6)
-//        Row 2: A2 (7), B2 (8), C2 (9), D2 (10), E2 (11), F2 (12), G2 (13)
-//        Row 3: A3 (14), B3 (15), C3 (16), D3 (17), E3 (18), F3 (19), G3 (20)
+//  SMART MEDICINE DISPENSER - ESP1 FIRMWARE (DRAWER 1: 21 DISCRETE LEDs)
+//  Version: 4.0 (Exact 3-Row x 7-Column Cell Matrix matching Mobile App)
 //
-//  Color Schemes:
-//    - GREEN  (0, 255, 0) : Normal active schedule (in stock)
-//    - RED    (255, 0, 0) : Out of stock (0/7 doses remaining)
-//    - PULSING/BLINKING WHITE/ORANGE : Active Alarm (due now within 20m window)
-//    - OFF    (0, 0, 0)   : Inactive / empty compartment
+//  Mobile App Layout Alignment:
+//    Columns: A, B, C, D, E, F, G (7 columns)
+//    Rows:    1, 2, 3             (3 rows)
 //
-//  Communication:
-//    - Wi-Fi HTTP REST Server (Port 80)
-//    - Serial commands (UART at 115200 baud)
+//    Row 1 (Top):    A1(4)   B1(5)   C1(6)   D1(7)   E1(8)   F1(9)   G1(10)  -> Slots 0..6
+//    Row 2 (Middle): A2(11)  B2(12)  C2(13)  D2(14)  E2(15)  F2(16)  G2(17)  -> Slots 7..13
+//    Row 3 (Bottom): A3(18)  B3(21)  C3(38)  D3(39)  E3(40)  F3(41)  G3(42)  -> Slots 14..20
+//
+//  Pin Verification:
+//    - GPIO 4  = A1 (Slot 0)
+//    - GPIO 5  = B1 (Slot 1)
+//    - GPIO 38 = C3 (Slot 16)
+//
+//  Features:
+//    1. 1-to-1 exact cell mapping: scheduling A1 only lits A1; scheduling C3 only lits C3!
+//    2. When scheduled: that compartment LED stays SOLID ON.
+//    3. When schedule is up: that compartment LED BLINKS rapidly (350ms interval).
+//    4. ESP32-Mini simultaneously vibrates on GPIO 4 during the alert.
+//    5. Non-blocking engine using millis() - Wi-Fi stays fast & responsive.
 // ==============================================================================
 
-#if defined(ESP8266)
-  #include <ESP8266WiFi.h>
-  #include <ESP8266WebServer.h>
-  #include <ESP8266mDNS.h>
-  #define WebServerClass ESP8266WebServer
-  #define LED_DATA_PIN  4  // D2 on NodeMCU / Wemos D1 Mini (GPIO 4)
-#elif defined(ESP32)
-  #include <WiFi.h>
-  #include <WebServer.h>
-  #include <ESPmDNS.h>
-  #define WebServerClass WebServer
-  #define LED_DATA_PIN  4  // GPIO 4 on ESP32
-#else
-  #error "Please select an ESP8266 or ESP32 board in Arduino IDE"
-#endif
-
-#include <Adafruit_NeoPixel.h>
-
-// ── Wi-Fi Credentials ────────────────────────────────────────────────────────
+// ── Wi-Fi Configuration ──────────────────────────────────────────────────────
 const char* ssid     = "Hi";            // <-- 2.4G Wi-Fi SSID
-const char* password = "estogs000";     // <-- 2.4G Wi-Fi Password
-const char* hostName = "dispenser-drawer1"; // mDNS: http://dispenser-drawer1.local
+const char* password = "estogs000";     // <-- 2.4G Wi-Fi password
+const char* hostName = "dispenser-drawer1"; // http://dispenser-drawer1.local
 
-// ── LED Strip Configuration ──────────────────────────────────────────────────
-#define NUM_LEDS      21        // 21 compartments in Drawer 1 (7 columns x 3 rows)
-#define BRIGHTNESS    180       // 0 - 255
-#define DRAWER_INDEX  1         // Drawer 1
-
-// WS2812B / NeoPixel configuration (GRB bitstream at 800 KHz)
-Adafruit_NeoPixel strip(NUM_LEDS, LED_DATA_PIN, NEO_GRB + NEO_KHZ800);
-
-WebServerClass server(80);
-
-// ── LED State Storage ────────────────────────────────────────────────────────
-enum CompartmentState {
-  STATE_OFF = 0,
-  STATE_ACTIVE_GREEN,
-  STATE_OUT_OF_STOCK_RED,
-  STATE_ALERTING_BLINK
+// ── 3x7 LED Pin Mapping ──────────────────────────────────────────────────────
+// Row 1: A1..G1
+// Row 2: A2..G2
+// Row 3: A3..G3
+const int ledPins[3][7] = {
+  {4,  5,  6,  7,  8,  9,  10}, // Row 1: A1(4), B1(5), C1(6), D1(7), E1(8), F1(9), G1(10)
+  {11, 12, 13, 14, 15, 16, 17}, // Row 2: A2(11), B2(12), C2(13), D2(14), E2(15), F2(16), G2(17)
+  {18, 21, 38, 39, 40, 41, 42}  // Row 3: A3(18), B3(21), C3(38), D3(39), E3(40), F3(41), G3(42)
 };
 
-CompartmentState slotStates[NUM_LEDS];
+// ── Compartment Labels Helper ────────────────────────────────────────────────
+const char* slotLabels[21] = {
+  "A1", "B1", "C1", "D1", "E1", "F1", "G1",
+  "A2", "B2", "C2", "D2", "E2", "F2", "G2",
+  "A3", "B3", "C3", "D3", "E3", "F3", "G3"
+};
 
-// Non-blocking blinking state for alerting LEDs
-bool blinkPhase = false;
-unsigned long lastBlinkTime = 0;
-const unsigned long BLINK_INTERVAL_MS = 350;
+// ── 21 Individual Slot States ────────────────────────────────────────────────
+bool slotScheduled[21] = {false}; // true = Solid ON (Active Schedule)
+bool slotAlerting[21]  = {false}; // true = Blinking (Alarm is due now)
 
-// ── Compartment String to Slot Index Mapper (e.g. "A1" -> 0, "G3" -> 20) ──────
-int compartmentToSlot(const String& comp) {
-  String c = comp;
-  c.toUpperCase();
-  c.trim();
+// Non-blocking blink timing
+unsigned long lastBlinkMs = 0;
+bool blinkState = false;
+const unsigned long BLINK_INTERVAL = 350; // ms
 
-  // Strip "DRAWER 1 (" or "(" if present
-  int openParen = c.indexOf('(');
-  if (openParen != -1) {
-    int closeParen = c.indexOf(')');
-    if (closeParen != -1) {
-      c = c.substring(openParen + 1, closeParen);
+WebServer server(80);
+
+// ── Coordinate Converter ─────────────────────────────────────────────────────
+// Returns slot index 0..20, or -1 if invalid
+int parseSlotIndex(const String& input) {
+  String s = input;
+  s.trim();
+  s.toUpperCase();
+
+  // Strip parentheses e.g. "Drawer 1 (C3)" -> "C3"
+  int p1 = s.indexOf('(');
+  if (p1 != -1) {
+    int p2 = s.indexOf(')', p1);
+    if (p2 != -1) s = s.substring(p1 + 1, p2);
+  }
+  s.trim();
+
+  // If passed directly as compartment label e.g. "A1", "C3"
+  for (int i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    if (c >= 'A' && c <= 'G') {
+      if (i + 1 < s.length()) {
+        char r = s.charAt(i + 1);
+        if (r >= '1' && r <= '3') {
+          int col = c - 'A';      // 0..6
+          int row = r - '1';      // 0..2
+          return row * 7 + col;   // 0..20
+        }
+      }
     }
   }
 
-  if (c.length() >= 2) {
-    char col = c.charAt(0);
-    char row = c.charAt(1);
-
-    if (col >= 'A' && col <= 'G' && row >= '1' && row <= '3') {
-      int colIdx = col - 'A';       // 0 to 6
-      int rowIdx = row - '1';       // 0 to 2
-      return rowIdx * 7 + colIdx;   // 0 to 20
+  // If passed as a numeric string e.g. "0".."20"
+  if (s.length() > 0) {
+    bool isNum = true;
+    for (int i = 0; i < s.length(); i++) {
+      if (!isDigit(s.charAt(i))) { isNum = false; break; }
+    }
+    if (isNum) {
+      int val = s.toInt();
+      if (val >= 0 && val < 21) return val;
     }
   }
+
   return -1;
 }
 
-// ── Set Hardware LED Output ──────────────────────────────────────────────────
-void applySlotColor(int slot, CompartmentState state, bool blinkOn = true) {
-  if (slot < 0 || slot >= NUM_LEDS) return;
+// ── Hardware LED Control ─────────────────────────────────────────────────────
+void setSlotLED(int slot, bool state) {
+  if (slot < 0 || slot >= 21) return;
+  int row = slot / 7;
+  int col = slot % 7;
+  digitalWrite(ledPins[row][col], state ? HIGH : LOW);
+}
 
-  switch (state) {
-    case STATE_OFF:
-      strip.setPixelColor(slot, strip.Color(0, 0, 0));
-      break;
+void allOn() {
+  for (int r = 0; r < 3; r++) {
+    for (int c = 0; c < 7; c++) {
+      digitalWrite(ledPins[r][c], HIGH);
+    }
+  }
+}
 
-    case STATE_ACTIVE_GREEN:
-      strip.setPixelColor(slot, strip.Color(0, 220, 0)); // Botanical Green
-      break;
+void allOff() {
+  for (int r = 0; r < 3; r++) {
+    for (int c = 0; c < 7; c++) {
+      digitalWrite(ledPins[r][c], LOW);
+    }
+  }
+}
 
-    case STATE_OUT_OF_STOCK_RED:
-      strip.setPixelColor(slot, strip.Color(255, 0, 0)); // Pure Warning Red
-      break;
+// ── Startup Visual Sweep Animation ───────────────────────────────────────────
+void runStartupAnimation() {
+  Serial.println("[ESP1] Running LED matrix verification (Row by Row, Col by Col)...");
+  
+  // Row 1 sweep
+  for (int c = 0; c < 7; c++) {
+    allOff();
+    digitalWrite(ledPins[0][c], HIGH);
+    delay(70);
+  }
+  // Row 2 sweep
+  for (int c = 0; c < 7; c++) {
+    allOff();
+    digitalWrite(ledPins[1][c], HIGH);
+    delay(70);
+  }
+  // Row 3 sweep
+  for (int c = 0; c < 7; c++) {
+    allOff();
+    digitalWrite(ledPins[2][c], HIGH);
+    delay(70);
+  }
 
-    case STATE_ALERTING_BLINK:
-      if (blinkOn) {
-        strip.setPixelColor(slot, strip.Color(255, 140, 0)); // Glowing Amber Alert
-      } else {
-        strip.setPixelColor(slot, strip.Color(40, 20, 0));  // Dim pulse
+  // Quick double flash of all 21 LEDs
+  allOn();
+  delay(150);
+  allOff();
+  delay(100);
+  allOn();
+  delay(150);
+  allOff();
+
+  Serial.println("[ESP1] Matrix verification complete.");
+}
+
+// ── State Mutators ───────────────────────────────────────────────────────────
+void setScheduleSlot(int slot, bool active = true) {
+  if (slot < 0 || slot >= 21) return;
+  slotScheduled[slot] = active;
+  if (!active) {
+    slotAlerting[slot] = false;
+  }
+  int r = slot / 7;
+  int c = slot % 7;
+  Serial.printf("[ESP1] Compartment %s (Slot %d, GPIO %d) Schedule: %s\n",
+                slotLabels[slot], slot, ledPins[r][c], active ? "LIT (SOLID ON)" : "OFF");
+}
+
+void setAlertSlot(int slot, bool alerting = true) {
+  if (slot < 0 || slot >= 21) return;
+  slotAlerting[slot] = alerting;
+  if (alerting) {
+    slotScheduled[slot] = true; // Ensure it stays active
+    int r = slot / 7;
+    int c = slot % 7;
+    Serial.printf("[ESP1] 🚨 ALARM UP! Compartment %s (Slot %d, GPIO %d) is BLINKING!\n",
+                  slotLabels[slot], slot, ledPins[r][c]);
+  } else {
+    Serial.printf("[ESP1] ⏹ Alert cleared for Compartment %s (Slot %d)\n", slotLabels[slot], slot);
+  }
+}
+
+void clearAll() {
+  for (int i = 0; i < 21; i++) {
+    slotScheduled[i] = false;
+    slotAlerting[i] = false;
+  }
+  allOff();
+  Serial.println("[ESP1] All 21 compartments cleared.");
+}
+
+// ── Non-Blocking LED Engine ──────────────────────────────────────────────────
+void updateLEDState() {
+  unsigned long now = millis();
+  if (now - lastBlinkMs >= BLINK_INTERVAL) {
+    lastBlinkMs = now;
+    blinkState = !blinkState;
+  }
+
+  for (int slot = 0; slot < 21; slot++) {
+    int r = slot / 7;
+    int c = slot % 7;
+
+    bool shouldBeOn = false;
+    if (slotAlerting[slot]) {
+      // Blinking alert when alarm is due
+      shouldBeOn = blinkState;
+    } else if (slotScheduled[slot]) {
+      // Solid ON when scheduled in mobile app
+      shouldBeOn = true;
+    }
+
+    digitalWrite(ledPins[r][c], shouldBeOn ? HIGH : LOW);
+  }
+}
+
+// ── HTTP CORS Headers ────────────────────────────────────────────────────────
+void sendCORSHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+// ── HTTP Request Handlers ────────────────────────────────────────────────────
+void handleOptions() {
+  sendCORSHeaders();
+  server.send(204);
+}
+
+// GET/POST /schedule?slot=0 or ?comp=A1 or ?col=0&row=1
+void handleSchedule() {
+  sendCORSHeaders();
+  int slot = -1;
+
+  if (server.hasArg("slot")) {
+    slot = server.arg("slot").toInt();
+  } else if (server.hasArg("comp")) {
+    slot = parseSlotIndex(server.arg("comp"));
+  } else if (server.hasArg("col") && server.hasArg("row")) {
+    int col = server.arg("col").toInt();
+    int row = server.arg("row").toInt() - 1; // row 1..3 -> 0..2
+    if (row >= 0 && row < 3 && col >= 0 && col < 7) {
+      slot = row * 7 + col;
+    }
+  } else if (server.hasArg("col")) {
+    // If only column provided, schedule all 3 rows in that column
+    int col = server.arg("col").toInt();
+    if (col >= 0 && col < 7) {
+      for (int r = 0; r < 3; r++) setScheduleSlot(r * 7 + col, true);
+      server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"column_scheduled\",\"col\":" + String(col) + "}");
+      return;
+    }
+  }
+
+  if (slot >= 0 && slot < 21) {
+    setScheduleSlot(slot, true);
+    String resp = "{\"status\":\"ok\",\"slot\":" + String(slot) + ",\"compartment\":\"" + String(slotLabels[slot]) + "\",\"gpio\":" + String(ledPins[slot/7][slot%7]) + ",\"state\":\"SOLID_ON\"}";
+    server.send(200, "application/json", resp);
+  } else {
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Provide valid slot (0..20) or comp (A1..G3)\"}");
+  }
+}
+
+// GET/POST /alert?slot=0 or ?comp=A1 (Called by ESP32-Mini when alarm is due!)
+void handleAlert() {
+  sendCORSHeaders();
+  int slot = -1;
+
+  if (server.hasArg("slot")) {
+    slot = server.arg("slot").toInt();
+  } else if (server.hasArg("comp")) {
+    slot = parseSlotIndex(server.arg("comp"));
+  } else if (server.hasArg("col") && server.hasArg("row")) {
+    int col = server.arg("col").toInt();
+    int row = server.arg("row").toInt() - 1;
+    if (row >= 0 && row < 3 && col >= 0 && col < 7) {
+      slot = row * 7 + col;
+    }
+  }
+
+  if (slot >= 0 && slot < 21) {
+    setAlertSlot(slot, true);
+    String resp = "{\"status\":\"ok\",\"action\":\"alert_started\",\"slot\":" + String(slot) + ",\"compartment\":\"" + String(slotLabels[slot]) + "\",\"mode\":\"BLINKING\"}";
+    server.send(200, "application/json", resp);
+  } else {
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing slot or comp\"}");
+  }
+}
+
+// GET/POST /clear-alert?slot=0 or /stop-alert
+void handleClearAlert() {
+  sendCORSHeaders();
+  if (server.hasArg("slot")) {
+    int slot = server.arg("slot").toInt();
+    setAlertSlot(slot, false);
+  } else if (server.hasArg("comp")) {
+    int slot = parseSlotIndex(server.arg("comp"));
+    if (slot >= 0) setAlertSlot(slot, false);
+  } else {
+    // Clear all alerts
+    for (int i = 0; i < 21; i++) slotAlerting[i] = false;
+    Serial.println("[ESP1] Cleared all active alerts.");
+  }
+  server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"alert_cleared\"}");
+}
+
+// GET/POST /led?slot=0&state=active (Contract called by ESP32-Mini master)
+void handleLed() {
+  sendCORSHeaders();
+  int slot = -1;
+
+  if (server.hasArg("slot")) {
+    slot = server.arg("slot").toInt();
+  } else if (server.hasArg("comp")) {
+    slot = parseSlotIndex(server.arg("comp"));
+  }
+
+  String state = server.hasArg("state") ? server.arg("state") : "active";
+
+  if (slot >= 0 && slot < 21) {
+    if (state.equalsIgnoreCase("active") || state.equalsIgnoreCase("on") || state.equalsIgnoreCase("green")) {
+      setScheduleSlot(slot, true);
+    } else if (state.equalsIgnoreCase("alert") || state.equalsIgnoreCase("blink")) {
+      setAlertSlot(slot, true);
+    } else if (state.equalsIgnoreCase("off") || state.equalsIgnoreCase("inactive")) {
+      setScheduleSlot(slot, false);
+    }
+    server.send(200, "application/json", "{\"status\":\"ok\",\"slot\":" + String(slot) + ",\"compartment\":\"" + String(slotLabels[slot]) + "\",\"state\":\"" + state + "\"}");
+  } else {
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid slot or comp\"}");
+  }
+}
+
+// GET /clear (Turns all off)
+void handleClear() {
+  sendCORSHeaders();
+  clearAll();
+  server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"All LEDs cleared\"}");
+}
+
+// GET /test (Plays matrix test)
+void handleTest() {
+  sendCORSHeaders();
+  runStartupAnimation();
+  server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Matrix test animation executed\"}");
+}
+
+// GET /status
+void handleStatus() {
+  sendCORSHeaders();
+  String json = "{";
+  json += "\"status\":\"online\",";
+  json += "\"device\":\"ESP1-Drawer1-DiscreteMatrix\",";
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  
+  json += "\"slots\":[";
+  for (int i = 0; i < 21; i++) {
+    if (i > 0) json += ",";
+    json += "{\"slot\":" + String(i) + ",\"comp\":\"" + String(slotLabels[i]) + "\",";
+    json += "\"gpio\":" + String(ledPins[i/7][i%7]) + ",";
+    json += "\"scheduled\":" + String(slotScheduled[i] ? "true" : "false") + ",";
+    json += "\"alerting\":" + String(slotAlerting[i] ? "true" : "false") + "}";
+  }
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
+// GET / (Visual Dashboard matching Mobile App Layout)
+void handleRoot() {
+  sendCORSHeaders();
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1.0'>";
+  html += "<title>ESP1 - Drawer 1 Compartments</title>";
+  html += "<style>body{font-family:sans-serif;background:#18181B;color:#F4F4F5;padding:16px;text-align:center;}";
+  html += ".grid-wrap{max-width:480px;margin:0 auto;background:#27272A;padding:16px;border-radius:16px;box-shadow:0 4px 12px rgba(0,0,0,0.5);}";
+  html += ".row-header{display:grid;grid-template-columns:30px repeat(7, 1fr);gap:6px;font-weight:700;color:#22C55E;margin-bottom:8px;}";
+  html += ".grid-row{display:grid;grid-template-columns:30px repeat(7, 1fr);gap:6px;align-items:center;margin-bottom:8px;}";
+  html += ".row-num{color:#22C55E;font-weight:700;}";
+  html += ".cell{background:#3F3F46;border-radius:8px;padding:8px 2px;font-size:11px;font-weight:700;text-decoration:none;display:block;color:#D4D4D8;border:2px solid transparent;}";
+  html += ".cell-on{background:#064E3B;color:#6EE7B7;border-color:#10B981;box-shadow:0 0 8px #10B981;}";
+  html += ".cell-alert{background:#7C2D12;color:#FDBA74;border-color:#F97316;box-shadow:0 0 12px #F97316;animation:blink 0.7s infinite alternate;}";
+  html += "@keyframes blink{from{opacity:1;}to{opacity:0.3;}}";
+  html += ".btn{display:inline-block;padding:8px 14px;border-radius:8px;text-decoration:none;font-weight:700;margin:6px;font-size:13px;}";
+  html += ".btn-blue{background:#2563EB;color:#fff;} .btn-red{background:#DC2626;color:#fff;} .btn-orange{background:#EA580C;color:#fff;}";
+  html += "</style></head><body>";
+  html += "<h2>💊 Drawer 1 Matrix (21 Compartments)</h2>";
+  html += "<p>IP: <strong>" + WiFi.localIP().toString() + "</strong> | Wi-Fi: <strong>" + String(ssid) + "</strong></p>";
+
+  html += "<div class='grid-wrap'>";
+  // Column letters: A B C D E F G
+  html += "<div class='row-header'><div></div>";
+  for (int c = 0; c < 7; c++) {
+    html += "<div>" + String((char)('A' + c)) + "</div>";
+  }
+  html += "</div>";
+
+  // Rows 1, 2, 3
+  for (int r = 0; r < 3; r++) {
+    html += "<div class='grid-row'>";
+    html += "<div class='row-num'>" + String(r + 1) + "</div>";
+    for (int c = 0; c < 7; c++) {
+      int slot = r * 7 + c;
+      String cls = "cell";
+      if (slotAlerting[slot]) cls += " cell-alert";
+      else if (slotScheduled[slot]) cls += " cell-on";
+      html += "<a href='/led?slot=" + String(slot) + "&state=" + (slotScheduled[slot] ? "off" : "active") + "' class='" + cls + "'>";
+      html += String(slotLabels[slot]) + "<br><small style='font-size:9px;opacity:0.8;'>G" + String(ledPins[r][c]) + "</small>";
+      html += "</a>";
+    }
+    html += "</div>";
+  }
+  html += "</div>";
+
+  html += "<div style='margin-top:16px;'>";
+  html += "<a href='/test' class='btn btn-blue'>✨ Test Matrix Sweep</a>";
+  html += "<a href='/clear-alert' class='btn btn-orange'>⏹ Silence Alert</a>";
+  html += "<a href='/clear' class='btn btn-red'>🧹 Clear All LEDs</a>";
+  html += "</div>";
+  html += "<p style='font-size:12px;color:#A1A1AA;margin-top:8px;'>Tip: Tap any cell above to toggle its LED solid ON/OFF.</p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+// ── Serial Command Handler ───────────────────────────────────────────────────
+void handleSerialCommands() {
+  if (Serial.available() > 0) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.length() == 0) return;
+
+    Serial.printf("[ESP1 <- SERIAL] %s\n", cmd.c_str());
+
+    // Format from ESP32-Mini: LED:1:<slot>:<action> (e.g. LED:1:16:alert or LED:1:0:active)
+    if (cmd.startsWith("LED:")) {
+      int firstColon = cmd.indexOf(':');
+      int secondColon = cmd.indexOf(':', firstColon + 1);
+      int thirdColon = cmd.indexOf(':', secondColon + 1);
+
+      if (secondColon != -1 && thirdColon != -1) {
+        int slot = cmd.substring(secondColon + 1, thirdColon).toInt();
+        String action = cmd.substring(thirdColon + 1);
+
+        if (action.equalsIgnoreCase("alert")) {
+          setAlertSlot(slot, true);
+        } else if (action.equalsIgnoreCase("clear-alert") || action.equalsIgnoreCase("off")) {
+          setAlertSlot(slot, false);
+          if (action.equalsIgnoreCase("off")) setScheduleSlot(slot, false);
+        } else if (action.indexOf("active") != -1 || action.indexOf("green") != -1) {
+          setScheduleSlot(slot, true);
+        }
       }
-      break;
+    } else if (cmd.startsWith("ALERT:")) {
+      String arg = cmd.substring(6);
+      int slot = parseSlotIndex(arg);
+      if (slot >= 0) setAlertSlot(slot, true);
+    } else if (cmd.startsWith("SCHEDULE:")) {
+      String arg = cmd.substring(9);
+      int slot = parseSlotIndex(arg);
+      if (slot >= 0) setScheduleSlot(slot, true);
+    } else if (cmd.equalsIgnoreCase("STOP") || cmd.equalsIgnoreCase("CLEAR-ALERT")) {
+      for (int i = 0; i < 21; i++) slotAlerting[i] = false;
+      Serial.println("[ESP1] Cleared alerts.");
+    } else if (cmd.equalsIgnoreCase("CLEAR")) {
+      clearAll();
+    } else if (cmd.equalsIgnoreCase("TEST")) {
+      runStartupAnimation();
+    } else if (cmd.equalsIgnoreCase("STATUS") || cmd.equalsIgnoreCase("IP")) {
+      Serial.printf("[ESP1] IP: %s | Wi-Fi: %s (RSSI: %d dBm)\n",
+                    WiFi.localIP().toString().c_str(), ssid, WiFi.RSSI());
+    }
   }
 }
 
-void renderAllLEDs() {
-  for (int i = 0; i < NUM_LEDS; i++) {
-    applySlotColor(i, slotStates[i], blinkPhase);
+// ── Setup ────────────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n========================================================");
+  Serial.println("  SMART MEDICINE DISPENSER - ESP1 (DRAWER 1 LED MATRIX) ");
+  Serial.println("  Exact 3x7 Grid: A1(GPIO 4) ... C3(GPIO 38) ... G3(42)");
+  Serial.println("========================================================");
+
+  // Initialize all 21 LED GPIO pins as OUTPUT and LOW
+  for (int r = 0; r < 3; r++) {
+    for (int c = 0; c < 7; c++) {
+      pinMode(ledPins[r][c], OUTPUT);
+      digitalWrite(ledPins[r][c], LOW);
+    }
   }
-  strip.show();
-}
 
-// ── Wi-Fi Connection Helper ──────────────────────────────────────────────────
-void setupWiFi() {
-  Serial.print("[ESP1] Connecting to Wi-Fi SSID: ");
-  Serial.println(ssid);
-
+  // Connect to Wi-Fi
+  Serial.printf("[WIFI] Connecting to '%s'...\n", ssid);
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false); // Keeps radio active for instant ping & response
   WiFi.begin(ssid, password);
 
   int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 25) {
+  while (WiFi.status() != WL_CONNECTED && retries < 30) {
     delay(500);
     Serial.print(".");
     retries++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n[ESP1] Wi-Fi Connected!");
-    Serial.print("[ESP1] Drawer 1 IP Address: ");
-    Serial.println(WiFi.localIP());
+    Serial.println("\n[WIFI] Connected!");
+    Serial.printf("[WIFI] Drawer 1 IP Address: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("[WIFI] Gateway: %s | RSSI: %d dBm\n", WiFi.gatewayIP().toString().c_str(), WiFi.RSSI());
 
     if (MDNS.begin(hostName)) {
-      Serial.printf("[ESP1] mDNS responder started: http://%s.local\n", hostName);
+      Serial.printf("[MDNS] Started: http://%s.local\n", hostName);
     }
   } else {
-    Serial.println("\n[ESP1] Wi-Fi Connection failed. Running in Serial-only mode.");
-  }
-}
-
-// ── CORS Headers for Web/Mobile Apps ─────────────────────────────────────────
-void sendCORS() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
-}
-
-// ── HTTP API Handlers ────────────────────────────────────────────────────────
-
-// GET /status
-void handleStatus() {
-  sendCORS();
-  String json = "{";
-  json += "\"drawer\":1,";
-  json += "\"device\":\"ESP1-Drawer1-LEDs\",";
-  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
-  json += "\"led_count\":" + String(NUM_LEDS) + ",";
-  json += "\"slots\":[";
-  for (int i = 0; i < NUM_LEDS; i++) {
-    if (i > 0) json += ",";
-    json += String(slotStates[i]);
-  }
-  json += "]}";
-  server.send(200, "application/json", json);
-}
-
-// GET /led?slot=0&state=active|out_of_stock|alert|off&color=green|red|orange|off
-void handleSetLED() {
-  sendCORS();
-
-  int slot = -1;
-  if (server.hasArg("slot")) {
-    slot = server.arg("slot").toInt();
-  } else if (server.hasArg("comp")) {
-    slot = compartmentToSlot(server.arg("comp"));
+    Serial.println("\n[WIFI] ⚠️ Wi-Fi not connected yet. Will retry in background.");
   }
 
-  if (slot < 0 || slot >= NUM_LEDS) {
-    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid slot (0-20 required)\"}");
-    return;
-  }
-
-  String stateArg = server.hasArg("state") ? server.arg("state") : "";
-  String colorArg = server.hasArg("color") ? server.arg("color") : "";
-  stateArg.toLowerCase();
-  colorArg.toLowerCase();
-
-  if (stateArg == "alert" || colorArg == "alert" || colorArg == "orange") {
-    slotStates[slot] = STATE_ALERTING_BLINK;
-  } else if (stateArg == "out_of_stock" || stateArg == "empty" || colorArg == "red") {
-    slotStates[slot] = STATE_OUT_OF_STOCK_RED;
-  } else if (stateArg == "active" || stateArg == "on" || colorArg == "green") {
-    slotStates[slot] = STATE_ACTIVE_GREEN;
-  } else if (stateArg == "off" || colorArg == "off") {
-    slotStates[slot] = STATE_OFF;
-  }
-
-  renderAllLEDs();
-
-  Serial.printf("[ESP1] Slot %d set to state %d\n", slot, slotStates[slot]);
-  server.send(200, "application/json", "{\"status\":\"ok\",\"drawer\":1,\"slot\":" + String(slot) + ",\"state\":" + String(slotStates[slot]) + "}");
-}
-
-// GET /alert?slot=0 (Starts flashing amber alert)
-void handleAlert() {
-  sendCORS();
-  int slot = -1;
-  if (server.hasArg("slot")) {
-    slot = server.arg("slot").toInt();
-  } else if (server.hasArg("comp")) {
-    slot = compartmentToSlot(server.arg("comp"));
-  }
-
-  if (slot >= 0 && slot < NUM_LEDS) {
-    slotStates[slot] = STATE_ALERTING_BLINK;
-    renderAllLEDs();
-    server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"alerting\",\"slot\":" + String(slot) + "}");
-  } else {
-    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid slot\"}");
-  }
-}
-
-// GET /clear-alert?slot=0 (Restores to active green or off)
-void handleClearAlert() {
-  sendCORS();
-  int slot = -1;
-  if (server.hasArg("slot")) {
-    slot = server.arg("slot").toInt();
-  } else if (server.hasArg("comp")) {
-    slot = compartmentToSlot(server.arg("comp"));
-  }
-
-  if (slot >= 0 && slot < NUM_LEDS) {
-    slotStates[slot] = STATE_ACTIVE_GREEN;
-    renderAllLEDs();
-    server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"cleared\",\"slot\":" + String(slot) + "}");
-  } else {
-    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid slot\"}");
-  }
-}
-
-// GET /clear (Turn all 21 LEDs off)
-void handleClearAll() {
-  sendCORS();
-  for (int i = 0; i < NUM_LEDS; i++) {
-    slotStates[i] = STATE_OFF;
-  }
-  renderAllLEDs();
-  Serial.println("[ESP1] All 21 LEDs cleared.");
-  server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"all_cleared\"}");
-}
-
-// GET /test (Sequential sweep animation through all 21 LEDs)
-void handleTestSweep() {
-  sendCORS();
-  server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"testing_sweep\"}");
-
-  // Quick rainbow/sweep test
-  for (int i = 0; i < NUM_LEDS; i++) {
-    strip.setPixelColor(i, strip.Color(0, 255, 0));
-    strip.show();
-    delay(50);
-  }
-  delay(300);
-  for (int i = 0; i < NUM_LEDS; i++) {
-    strip.setPixelColor(i, strip.Color(255, 0, 0));
-    strip.show();
-    delay(50);
-  }
-  delay(300);
-  renderAllLEDs();
-}
-
-// ── Setup ────────────────────────────────────────────────────────────────────
-void setup() {
-  Serial.begin(115200);
-  Serial.println("\n[ESP1] Booting Drawer 1 (21 LEDs Controller)...");
-
-  // Initialize NeoPixel Strip
-  strip.begin();
-  strip.setBrightness(BRIGHTNESS);
-  strip.clear();
-  strip.show();
-
-  // Initialize all slots to OFF
-  for (int i = 0; i < NUM_LEDS; i++) {
-    slotStates[i] = STATE_OFF;
-  }
-
-  // Quick power-on self test (Flash green once)
-  for (int i = 0; i < NUM_LEDS; i++) strip.setPixelColor(i, strip.Color(0, 100, 0));
-  strip.show();
-  delay(400);
-  strip.clear();
-  strip.show();
-
-  setupWiFi();
-
-  // Register Web Server Endpoints
+  // Setup Web Server Endpoints
+  server.on("/", HTTP_GET, handleRoot);
   server.on("/status", HTTP_GET, handleStatus);
-  server.on("/led", HTTP_GET, handleSetLED);
+  server.on("/ping", HTTP_GET, handleStatus);
+  server.on("/schedule", HTTP_GET, handleSchedule);
+  server.on("/schedule", HTTP_POST, handleSchedule);
+  server.on("/led", HTTP_GET, handleLed);
   server.on("/alert", HTTP_GET, handleAlert);
+  server.on("/alert", HTTP_POST, handleAlert);
   server.on("/clear-alert", HTTP_GET, handleClearAlert);
-  server.on("/clear", HTTP_GET, handleClearAll);
-  server.on("/test", HTTP_GET, handleTestSweep);
+  server.on("/clear-alert", HTTP_POST, handleClearAlert);
+  server.on("/clear", HTTP_GET, handleClear);
+  server.on("/test", HTTP_GET, handleTest);
+
+  server.on("/schedule", HTTP_OPTIONS, handleOptions);
+  server.on("/alert", HTTP_OPTIONS, handleOptions);
+  server.on("/clear-alert", HTTP_OPTIONS, handleOptions);
+  server.on("/led", HTTP_OPTIONS, handleOptions);
 
   server.begin();
-  Serial.println("[ESP1] HTTP Server active on port 80");
+  Serial.println("[HTTP] Server listening on port 80");
+
+  // Visual startup verification sweep
+  runStartupAnimation();
 }
 
 // ── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
-  // 1. Handle HTTP Requests
   server.handleClient();
+  updateLEDState();
+  handleSerialCommands();
 
-  // 2. Non-blocking blinking for any actively alerting compartments
-  unsigned long now = millis();
-  if (now - lastBlinkTime >= BLINK_INTERVAL_MS) {
-    lastBlinkTime = now;
-    blinkPhase = !blinkPhase;
-
-    bool hasAlerting = false;
-    for (int i = 0; i < NUM_LEDS; i++) {
-      if (slotStates[i] == STATE_ALERTING_BLINK) {
-        hasAlerting = true;
-        break;
-      }
-    }
-
-    if (hasAlerting) {
-      renderAllLEDs();
-    }
+  // Reconnect Wi-Fi if connection drops
+  static unsigned long lastReconnectCheck = 0;
+  if (WiFi.status() != WL_CONNECTED && (millis() - lastReconnectCheck >= 10000)) {
+    lastReconnectCheck = millis();
+    Serial.println("[WIFI] Reconnecting...");
+    WiFi.reconnect();
   }
 
-  // 3. Serial Command Interface (Fallback / Direct Master UART)
-  // Format: "LED:0:GREEN", "LED:0:RED", "ALERT:0", "CLEAR"
-  if (Serial.available() > 0) {
-    String line = Serial.readStringUntil('\n');
-    line.trim();
-
-    if (line == "CLEAR") {
-      handleClearAll();
-    } else if (line.startsWith("ALERT:")) {
-      int s = line.substring(6).toInt();
-      if (s >= 0 && s < NUM_LEDS) {
-        slotStates[s] = STATE_ALERTING_BLINK;
-        renderAllLEDs();
-      }
-    } else if (line.startsWith("LED:")) {
-      // E.g., "LED:0:GREEN" or "LED:0:RED" or "LED:0:OFF"
-      int firstColon = line.indexOf(':');
-      int secondColon = line.indexOf(':', firstColon + 1);
-      if (firstColon != -1 && secondColon != -1) {
-        int s = line.substring(firstColon + 1, secondColon).toInt();
-        String col = line.substring(secondColon + 1);
-        col.toUpperCase();
-        if (s >= 0 && s < NUM_LEDS) {
-          if (col == "GREEN") slotStates[s] = STATE_ACTIVE_GREEN;
-          else if (col == "RED") slotStates[s] = STATE_OUT_OF_STOCK_RED;
-          else if (col == "ALERT" || col == "ORANGE") slotStates[s] = STATE_ALERTING_BLINK;
-          else slotStates[s] = STATE_OFF;
-          renderAllLEDs();
-        }
-      }
+  // Heartbeat every 10 seconds to Serial
+  static unsigned long lastHeartbeat = 0;
+  if (millis() - lastHeartbeat >= 10000) {
+    lastHeartbeat = millis();
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("[ESP1 HEARTBEAT] 🟢 IP: %s | http://%s.local\n",
+                    WiFi.localIP().toString().c_str(), hostName);
     }
   }
 }

@@ -272,25 +272,28 @@ void logDoseEvent(const char* scheduleId, const char* compartment, const char* r
 
 // ── Notify Drawer 1 (ESP1) or Drawer 2 (ESP2) LEDs over Wi-Fi ────────────────
 void notifyDrawerLED(int drawer, int slot, const String& action) {
-  // Also output to Serial for wired UART bridge
+  int col = slot % 7;
+  // Also output to Serial for wired UART bridge (e.g. LED:1:0:alert)
   Serial.printf("LED:%d:%d:%s\n", drawer, slot, action.c_str());
 
   if (WiFi.status() != WL_CONNECTED) return;
 
+  char sep = (action.indexOf('?') != -1) ? '&' : '?';
   String targetUrl = "";
   if (drawer == 1) {
-    targetUrl = String(DRAWER1_HOST) + "/" + action + "?slot=" + String(slot);
+    targetUrl = String(DRAWER1_HOST) + "/" + action + sep + "slot=" + String(slot) + "&col=" + String(col);
   } else if (drawer == 2) {
     int localSlot = (slot >= 21) ? (slot - 21) : slot;
-    targetUrl = String(DRAWER2_HOST) + "/" + action + "?slot=" + String(localSlot);
+    targetUrl = String(DRAWER2_HOST) + "/" + action + sep + "slot=" + String(localSlot) + "&col=" + String(localSlot % 7);
   }
 
   if (targetUrl.length() > 0) {
     HTTPClient http;
     http.begin(targetUrl);
     http.setTimeout(1200); // 1.2s timeout
-    http.GET();
+    int code = http.GET();
     http.end();
+    Serial.printf("[DRAWER HTTP] %s -> HTTP %d\n", targetUrl.c_str(), code);
   }
 }
 
@@ -722,6 +725,33 @@ void handleGetSchedules() {
   server.send(200, "application/json", json);
 }
 
+// GET /test-alert?slot=0 or ?col=0 (Triggers VIBRATION + ESP1 Drawer Column Blinking)
+void handleTestAlert() {
+  sendCORSHeaders();
+  int slot = server.hasArg("slot") ? server.arg("slot").toInt() : 0;
+  if (server.hasArg("col")) {
+    slot = server.arg("col").toInt(); // Col 0..6
+  }
+  int col = slot % 7;
+
+  currentAlert.isAlerting = true;
+  strncpy(currentAlert.scheduleId, "test_schedule", sizeof(currentAlert.scheduleId));
+  snprintf(currentAlert.compartment, sizeof(currentAlert.compartment), "Col %c (Slot %d)", 'A' + col, slot);
+  currentAlert.slotIndex = slot;
+  currentAlert.relayNum = (slot % 4) + 1;
+  currentAlert.alertStartEpoch = getCurrentEpoch();
+  currentAlert.lastReminderVibrateMs = millis();
+
+  // 1. Start strong vibration pattern on ESP32-Mini GPIO 4
+  startVibrationAlert(3, 700, 300);
+
+  // 2. Notify ESP1 (Drawer 1) over Wi-Fi to start blinking that column
+  notifyDrawerLED(1, slot, "alert");
+
+  String resp = "{\"status\":\"ok\",\"action\":\"alert_started\",\"slot\":" + String(slot) + ",\"column\":" + String(col) + ",\"vibrating\":true}";
+  server.send(200, "application/json", resp);
+}
+
 // GET /dashboard
 void handleRoot() {
   sendCORSHeaders();
@@ -730,15 +760,19 @@ void handleRoot() {
   html += "<style>body{font-family:sans-serif;background:#F5F0E8;padding:20px;color:#212121;}";
   html += ".card{background:#fff;border-radius:16px;padding:20px;margin-bottom:16px;box-shadow:0 2px 8px rgba(0,0,0,0.08);}";
   html += ".btn{display:inline-block;padding:12px 20px;border-radius:10px;text-decoration:none;font-weight:700;margin-right:8px;margin-bottom:8px;}";
-  html += ".btn-green{background:#2E9E4B;color:#fff;} .btn-red{background:#EF4444;color:#fff;} .btn-orange{background:#F59E0B;color:#fff;}";
+  html += ".btn-green{background:#2E9E4B;color:#fff;} .btn-red{background:#EF4444;color:#fff;} .btn-orange{background:#F59E0B;color:#fff;} .btn-blue{background:#2563EB;color:#fff;}";
   html += "</style></head><body>";
-  html += "<h1>💊 Smart Medicine Dispenser</h1>";
+  html += "<h1>💊 Smart Medicine Dispenser Controller</h1>";
   html += "<div class='card'><h2>Current Status</h2>";
   html += "<p><strong>Device Time:</strong> " + getCurrentTimeString() + "</p>";
   html += "<p><strong>Active Alert:</strong> " + String(currentAlert.isAlerting ? "🚨 DUE NOW (" + String(currentAlert.compartment) + ")" : "✅ Normal") + "</p>";
-  html += "<p><strong>Vibration Motor:</strong> " + String(isVibrating ? "📳 ACTIVE" : "Idle") + "</p>";
-  html += "<a href='/vibrate?duration=2500' class='btn btn-orange'>📳 Test Vibration</a>";
-  html += "<a href='/stop-vibrate' class='btn btn-green'>⏹ Silence / Take Dose</a>";
+  html += "<p><strong>Vibration Motor (GPIO 4):</strong> " + String(isVibrating ? "📳 VIBRATING" : "Idle") + "</p>";
+  html += "<hr style='margin:16px 0;border:0;border-top:1px solid #eee;'>";
+  html += "<h3>🚀 Direct Test Controls:</h3>";
+  html += "<a href='/test-alert?slot=0' class='btn btn-orange'>🚨 Test Alert (Vibrate + Blink Col A)</a>";
+  html += "<a href='/stop-vibrate' class='btn btn-green'>⏹ Silence / Dose Taken</a>";
+  html += "<a href='/vibrate?duration=2500' class='btn btn-blue'>📳 Vibrate Motor Only</a>";
+  html += "<a href='/set-schedule?slotIndex=0&hour=8&minute=0&compartment=Drawer+1+(A1)' class='btn btn-green'>📅 Schedule Col A (Slot 0)</a>";
   html += "</div></body></html>";
   server.send(200, "text/html", html);
 }
@@ -816,6 +850,7 @@ void setup() {
   server.on("/set-schedule", HTTP_POST, handleSetSchedule);
   server.on("/delete-schedule", HTTP_GET, handleDeleteSchedule);
   server.on("/schedules", HTTP_GET, handleGetSchedules);
+  server.on("/test-alert", HTTP_GET, handleTestAlert);
 
   server.on("/vibrate", HTTP_OPTIONS, handleOptions);
   server.on("/stop-vibrate", HTTP_OPTIONS, handleOptions);
