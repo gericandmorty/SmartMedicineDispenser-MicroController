@@ -297,6 +297,19 @@ void notifyDrawerLED(int drawer, int slot, const String& action) {
   }
 }
 
+// ── Notify ESP1 / ESP2 when Reed Switch Opens or Closes ─────────────────────
+void notifyDrawerDoorState(int drawer, bool isOpen) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  String host = (drawer == 1) ? DRAWER1_HOST : DRAWER2_HOST;
+  String url = host + "/door?state=" + (isOpen ? "open" : "closed");
+  http.begin(url);
+  http.setTimeout(1200);
+  int code = http.GET();
+  http.end();
+  Serial.printf("[DOOR HTTP] Drawer %d -> %s (HTTP %d)\n", drawer, isOpen ? "OPEN (LEDs ON)" : "CLOSED (LEDs OFF)", code);
+}
+
 // ── Notify Arduino Controller over Serial & Wi-Fi ─────────────────────────────
 void notifyArduinoAlert(const String& compartment, int drawer = 1) {
   // 1. Output to Serial for wired UART bridge
@@ -475,24 +488,26 @@ void checkAlarms() {
         lastTriggeredHour = currentHour;
         lastTriggeredDay = currentDay;
 
-        // 1. Enter 20-minute Active Alert State
-        currentAlert.isAlerting = true;
-        strncpy(currentAlert.scheduleId, schedules[i].id, sizeof(currentAlert.scheduleId));
-        strncpy(currentAlert.compartment, schedules[i].compartment, sizeof(currentAlert.compartment));
-        currentAlert.slotIndex = schedules[i].slotIndex;
-        currentAlert.relayNum = (schedules[i].slotIndex % 4) + 1;
-        currentAlert.alertStartEpoch = getCurrentEpoch();
-        currentAlert.lastReminderVibrateMs = millis();
+        // 1. Enter 20-minute Active Alert State (if not already alerting)
+        if (!currentAlert.isAlerting) {
+          currentAlert.isAlerting = true;
+          strncpy(currentAlert.scheduleId, schedules[i].id, sizeof(currentAlert.scheduleId));
+          strncpy(currentAlert.compartment, schedules[i].compartment, sizeof(currentAlert.compartment));
+          currentAlert.slotIndex = schedules[i].slotIndex;
+          currentAlert.relayNum = (schedules[i].slotIndex % 4) + 1;
+          currentAlert.alertStartEpoch = getCurrentEpoch();
+          currentAlert.lastReminderVibrateMs = millis();
 
-        // 2. Start initial strong vibration pattern (3 strong pulses)
-        startVibrationAlert(3, 700, 300);
+          // 2. Start initial strong vibration pattern (3 strong pulses)
+          startVibrationAlert(3, 700, 300);
+        }
 
-        // 3. Trigger compartment LED on ESP1 (Drawer 1) or ESP2 (Drawer 2)
+        // 3. Trigger compartment LED on ESP1 (Drawer 1) or ESP2 (Drawer 2) for each scheduled item
         int drawer = (schedules[i].slotIndex >= 21) ? 2 : 1;
         notifyDrawerLED(drawer, schedules[i].slotIndex, "alert");
 
-        // 4. Trigger Hardware Relay & Arduino Buzzer/LCD (via Wi-Fi & Serial)
-        triggerDispenseRelay(currentAlert.relayNum);
+        // 4. Trigger Hardware Relay & Arduino Buzzer/LCD for each scheduled item
+        triggerDispenseRelay((schedules[i].slotIndex % 4) + 1);
         notifyArduinoAlert(schedules[i].compartment, drawer);
 
         // One-time schedule is marked inactive after firing
@@ -500,8 +515,6 @@ void checkAlarms() {
           schedules[i].active = false;
           saveSchedulesToNVS();
         }
-
-        break;
       }
     }
   }
@@ -620,6 +633,41 @@ void handleVibrate() {
 
   startVibrationAlert(pulses, onMs, 250);
   server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"vibrating\",\"pulses\":" + String(pulses) + "}");
+}
+
+// GET/POST /solenoid?drawer=1&state=unlock (or lock)
+void handleSolenoid() {
+  sendCORSHeaders();
+  int drw = 0;
+  if (server.hasArg("drawer")) drw = server.arg("drawer").toInt();
+  String state = server.hasArg("state") ? server.arg("state") : "unlock";
+  bool unlock = (state.equalsIgnoreCase("unlock") || state.equalsIgnoreCase("open") || state == "1");
+
+  if (unlock) {
+    if (drw == 1 || drw == 0) {
+      if (RELAY1_PIN >= 0) digitalWrite(RELAY1_PIN, RELAY_ON);
+      if (RELAY2_PIN >= 0) digitalWrite(RELAY2_PIN, RELAY_ON);
+    }
+    if (drw == 2 || drw == 0) {
+      if (RELAY3_PIN >= 0) digitalWrite(RELAY3_PIN, RELAY_ON);
+      if (RELAY4_PIN >= 0) digitalWrite(RELAY4_PIN, RELAY_ON);
+    }
+    Serial.printf("SOLENOID:%d UNLOCK\n", drw);
+    Serial.printf("[ESP32] Solenoid Drawer %d UNLOCKED\n", drw);
+  } else {
+    if (drw == 1 || drw == 0) {
+      if (RELAY1_PIN >= 0) digitalWrite(RELAY1_PIN, RELAY_OFF);
+      if (RELAY2_PIN >= 0) digitalWrite(RELAY2_PIN, RELAY_OFF);
+    }
+    if (drw == 2 || drw == 0) {
+      if (RELAY3_PIN >= 0) digitalWrite(RELAY3_PIN, RELAY_OFF);
+      if (RELAY4_PIN >= 0) digitalWrite(RELAY4_PIN, RELAY_OFF);
+    }
+    Serial.printf("SOLENOID:%d LOCK\n", drw);
+    Serial.printf("[ESP32] Solenoid Drawer %d LOCKED\n", drw);
+  }
+
+  server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"solenoid\",\"drawer\":" + String(drw) + ",\"unlocked\":" + String(unlock ? "true" : "false") + "}");
 }
 
 // GET /dispense
@@ -846,12 +894,15 @@ void setup() {
   server.on("/stop-vibrate", HTTP_GET, handleStopVibrate);
   server.on("/dispense-confirm", HTTP_POST, handleStopVibrate);
   server.on("/dispense", HTTP_GET, handleDispense);
+  server.on("/solenoid", HTTP_GET, handleSolenoid);
+  server.on("/solenoid", HTTP_POST, handleSolenoid);
   server.on("/set-schedule", HTTP_GET, handleSetSchedule);
   server.on("/set-schedule", HTTP_POST, handleSetSchedule);
   server.on("/delete-schedule", HTTP_GET, handleDeleteSchedule);
   server.on("/schedules", HTTP_GET, handleGetSchedules);
   server.on("/test-alert", HTTP_GET, handleTestAlert);
 
+  server.on("/solenoid", HTTP_OPTIONS, handleOptions);
   server.on("/vibrate", HTTP_OPTIONS, handleOptions);
   server.on("/stop-vibrate", HTTP_OPTIONS, handleOptions);
   server.on("/set-schedule", HTTP_OPTIONS, handleOptions);
@@ -869,6 +920,18 @@ void handleSerialFromArduino() {
       String comp = msg.substring(6);
       Serial.printf("[SERIAL <- ARDUINO] Magnetic Reed Switch Triggered! Dose TAKEN for: %s\n", comp.c_str());
       handleStopVibrate(); // Marks dose TAKEN, stops vibration, clears LED, logs event!
+    } else if (msg.startsWith("DRAWER:1:OPEN")) {
+      Serial.println("[SERIAL <- ARDUINO] Drawer 1 OPENED -> Telling ESP1 to enable LEDs!");
+      notifyDrawerDoorState(1, true);
+    } else if (msg.startsWith("DRAWER:1:CLOSE")) {
+      Serial.println("[SERIAL <- ARDUINO] Drawer 1 CLOSED -> Telling ESP1 to turn OFF all LEDs!");
+      notifyDrawerDoorState(1, false);
+    } else if (msg.startsWith("DRAWER:2:OPEN")) {
+      Serial.println("[SERIAL <- ARDUINO] Drawer 2 OPENED -> Telling ESP2 to enable LEDs!");
+      notifyDrawerDoorState(2, true);
+    } else if (msg.startsWith("DRAWER:2:CLOSE")) {
+      Serial.println("[SERIAL <- ARDUINO] Drawer 2 CLOSED -> Telling ESP2 to turn OFF all LEDs!");
+      notifyDrawerDoorState(2, false);
     } else if (msg.startsWith("MISSED:")) {
       Serial.println("[SERIAL <- ARDUINO] 20-Minute Grace Period Expired: MISSED");
     } else if (msg.equalsIgnoreCase("IP") || msg.equalsIgnoreCase("STATUS") || msg.equalsIgnoreCase("WIFI")) {

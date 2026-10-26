@@ -53,6 +53,7 @@ const char* slotLabels[21] = {
 // ── 21 Individual Slot States ────────────────────────────────────────────────
 bool slotScheduled[21] = {false}; // true = Solid ON (Active Schedule)
 bool slotAlerting[21]  = {false}; // true = Blinking (Alarm is due now)
+bool isDrawerOpen      = false;   // Default: CLOSED. LEDs will NOT lit if reed is closed, ONLY if open!
 
 // Non-blocking blink timing
 unsigned long lastBlinkMs = 0;
@@ -203,6 +204,13 @@ void clearAll() {
 
 // ── Non-Blocking LED Engine ──────────────────────────────────────────────────
 void updateLEDState() {
+  // If drawer reed switch is closed, LEDs will NOT lit up!
+  // Only if drawer reed switch is open will scheduled/alerting LEDs lit up!
+  if (!isDrawerOpen) {
+    allOff();
+    return;
+  }
+
   unsigned long now = millis();
   if (now - lastBlinkMs >= BLINK_INTERVAL) {
     lastBlinkMs = now;
@@ -223,6 +231,27 @@ void updateLEDState() {
     }
 
     digitalWrite(ledPins[r][c], shouldBeOn ? HIGH : LOW);
+  }
+}
+
+// ── Door / Reed Switch State Handler ─────────────────────────────────────────
+// GET/POST /door?state=open or /door?state=closed
+void handleDoorState() {
+  sendCORSHeaders();
+  String state = server.hasArg("state") ? server.arg("state") : "";
+  if (state.length() == 0 && server.hasArg("open")) {
+    state = (server.arg("open") == "1" || server.arg("open") == "true") ? "open" : "closed";
+  }
+
+  if (state.equalsIgnoreCase("open") || state == "1") {
+    isDrawerOpen = true;
+    Serial.println("[ESP1] 🚪 Drawer 1 is OPEN -> LEDs enabled (will lit up for scheduled/alerting slots)!");
+    server.send(200, "application/json", "{\"status\":\"ok\",\"drawer\":1,\"door\":\"open\",\"leds\":\"enabled\"}");
+  } else {
+    isDrawerOpen = false;
+    allOff();
+    Serial.println("[ESP1] 🚪 Drawer 1 is CLOSED -> All LEDs OFF (will not lit)!");
+    server.send(200, "application/json", "{\"status\":\"ok\",\"drawer\":1,\"door\":\"closed\",\"leds\":\"off\"}");
   }
 }
 
@@ -539,6 +568,15 @@ void setup() {
   server.on("/clear-alert", HTTP_POST, handleClearAlert);
   server.on("/clear", HTTP_GET, handleClear);
   server.on("/test", HTTP_GET, handleTest);
+
+  server.on("/door", HTTP_GET, handleDoorState);
+  server.on("/door", HTTP_POST, handleDoorState);
+  server.on("/drawer", HTTP_GET, handleDoorState);
+  server.on("/drawer", HTTP_POST, handleDoorState);
+  server.on("/reed", HTTP_GET, handleDoorState);
+  server.on("/door", HTTP_OPTIONS, handleOptions);
+  server.on("/drawer", HTTP_OPTIONS, handleOptions);
+  server.on("/reed", HTTP_OPTIONS, handleOptions);
 
   server.on("/schedule", HTTP_OPTIONS, handleOptions);
   server.on("/alert", HTTP_OPTIONS, handleOptions);
