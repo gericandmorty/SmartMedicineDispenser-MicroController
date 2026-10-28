@@ -1,6 +1,6 @@
 // ==============================================================================
 //  SMART MEDICINE DISPENSER - ARDUINO CONTROLLER (UNO R3 / UNO R4 WiFi)
-//  Firmware Version: 3.3 (Dual Solenoid Locks for Drawer 1 & Drawer 2 via Relays)
+//  Firmware Version: 3.3.3 (LCD stability patch; pins and alert logic retained)
 // ==============================================================================
 //  Hardware Setup:
 //    1. I2C LCD 16x2 Display:
@@ -94,13 +94,20 @@ const int SOLENOID_OFF  = HIGH; // Relay HIGH -> De-energizes Solenoid (Locks Do
 
 // ── Timing Configurations ────────────────────────────────────────────────────
 const unsigned long GRACE_PERIOD_MS    = 20UL * 60UL * 1000UL; // 20 mins = 1,200,000 ms
-const unsigned long BUZZER_DURATION_MS = 2UL * 60UL * 1000UL;  // 2 minutes buzzing cutoff = 120,000 ms
+const unsigned long BUZZER_DURATION_MS = 2UL * 60UL * 1000UL;  // Real scheduled alerts: 2 minutes
+const unsigned long STARTUP_BEEP_MS    = 10UL * 1000UL;         // Boot indication only: 10 seconds
 
 // Initialize 16x2 I2C LCD (Auto-detected in setup to 0x27 or 0x3F)
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // ── Multi-Compartment Alert Data Structures ──────────────────────────────────
+// The UNO R4 has enough RAM for all 42 physical compartments.
+// Keep the small memory footprint on a classic UNO R3.
+#if defined(ARDUINO_ARCH_RENESAS_UNO)
+const int MAX_ACTIVE_ALERTS = 42;
+#else
 const int MAX_ACTIVE_ALERTS = 8;
+#endif
 struct AlertCompartment {
   String shortLabel; // e.g. "B1", "B2", "B3"
   String fullName;   // e.g. "Drawer 1 (B1)"
@@ -119,9 +126,13 @@ const unsigned long DISPLAY_CYCLE_INTERVAL_MS = 2000; // Increment every 2 secon
 // ── Alert State Variables ────────────────────────────────────────────────────
 bool isAlertActive = false;
 unsigned long alertStartTime = 0;
+unsigned long buzzerStartTime = 0; // New due events restart their own 2-minute buzzing window.
+bool startupBeepActive = false;
+unsigned long startupBeepStartMs = 0;
 
 // Buzzer Cadence (1s BEEP / 1s PAUSE during the 2-minute buzzing window)
 bool buzzerState = false;
+bool buzzerMutedByDrawer = false; // Keep it silent after an alerting drawer opens.
 unsigned long lastBuzzerToggle = 0;
 const unsigned long BUZZER_BEEP_MS  = 1000; // 1s BEEP
 const unsigned long BUZZER_PAUSE_MS = 1000; // 1s PAUSE
@@ -156,7 +167,25 @@ String lastTakenSummary = "";
 unsigned long lcdResetTime = 0;
 bool lcdNeedsReset = false;
 unsigned long lastCountdownUpdate = 0;
-String lastLine1 = "";
+// All LCD changes below affect display transport only, not alert/control logic.
+unsigned long lastLCDRecoveryMs = 0;
+const unsigned long LCD_RECOVERY_MS = 20000UL;   // Recover LCD controller state after noise.
+const unsigned long LCD_REFRESH_MS = 5000UL;    // Rewrite visible text without clearing.
+const unsigned long LCD_PROBE_MS = 2500UL;      // Detect a disconnected/stalled I2C backpack.
+const unsigned long LCD_RELAY_QUIET_MS = 180UL; // Avoid writing just after a relay switches.
+const unsigned long LCD_MIN_WRITE_MS = 35UL;    // Batch changes instead of back-to-back writes.
+unsigned long lastLCDRefreshMs = 0;
+unsigned long lastLCDProbeMs = 0;
+unsigned long lastLCDWriteMs = 0;
+unsigned long lastRelayTransitionMs = 0;
+uint8_t lcdI2CAddress = 0x27;
+uint8_t lcdConsecutiveProbeFailures = 0;
+bool lcdReady = false;
+bool lcdOnline = true;
+bool lcdSetupPhase = true;
+String pendingLine1 = "";  // Requested lines; updated by alert, setup, and status code.
+String pendingLine2 = "";
+String lastLine1 = "";     // Last lines actually written to the LCD.
 String lastLine2 = "";
 String deviceIPStr = "";
 
@@ -168,8 +197,13 @@ struct ArduinoSchedule {
   int drawer;
   bool alertedToday;
   bool active;
+  String scheduleId; // Optional stable ID allows updates without replacing other times.
 };
+#if defined(ARDUINO_ARCH_RENESAS_UNO)
+const int MAX_ARDUINO_SCHEDULES = 64;
+#else
 const int MAX_ARDUINO_SCHEDULES = 10;
+#endif
 ArduinoSchedule schedules[MAX_ARDUINO_SCHEDULES];
 int scheduleCount = 0;
 
@@ -194,8 +228,8 @@ String extractShortLabel(const String& str) {
 
   for (int i = 0; i < s.length(); i++) {
     char c = s.charAt(i);
-    if (c >= 'A' && c <= 'G') {
-      if (i + 1 < s.length() && s.charAt(i + 1) >= '1' && s.charAt(i + 1) <= '3') {
+    if (c >= 'A' && c <= 'C') {
+      if (i + 1 < s.length() && s.charAt(i + 1) >= '1' && s.charAt(i + 1) <= '7') {
         return s.substring(i, i + 2);
       }
     }
@@ -204,26 +238,118 @@ String extractShortLabel(const String& str) {
   return s.length() > 6 ? s.substring(0, 6) : s;
 }
 
-// ── Helper: Format and write a fixed 16-character line to LCD without lcd.clear() ──
-void writeLCDLine(uint8_t row, const String& text) {
-  char buf[17];
-  int len = text.length();
-  for (int i = 0; i < 16; i++) {
-    buf[i] = (i < len) ? text[i] : ' ';
-  }
-  buf[16] = '\0';
-  lcd.setCursor(0, row);
-  lcd.print(buf);
+// ── Stable I2C LCD renderer (keeps ALL existing content/alert logic) ────────
+// Relay transitions can inject a glitch into the HD44780 LCD.  Defer the
+// I2C transfer briefly, send only changed characters, and periodically
+// refresh / reinitialize without calling lcd.clear() on every update.
+void writeRelayQuietly(int pin, int level) {
+  if (digitalRead(pin) != level) lastRelayTransitionMs = millis();
+  digitalWrite(pin, level);  // Same pins, polarities, and logical command as before.
 }
 
-// ── Helper: Update LCD Screen (Avoid redundant redraws & eliminates lcd.clear() flicker/corruption) ──
-void updateDisplay(const String& line1, const String& line2) {
-  if (line1 == lastLine1 && line2 == lastLine2) return;
-  lastLine1 = line1;
-  lastLine2 = line2;
+String formatLCDLine(const String& text) {
+  char line[17];
+  int len = text.length();
+  for (int i = 0; i < 16; i++) {
+    char ch = i < len ? text[i] : ' ';
+    // Standard 16x2 HD44780 character set: keep interface text to ASCII.
+    if ((unsigned char)ch < 32 || (unsigned char)ch > 126) ch = '?';
+    line[i] = ch;
+  }
+  line[16] = '\0';
+  return String(line);
+}
 
+// Queue the line.  This is intentionally independent of whether I2C is
+// temporarily offline; the newest text is not lost while waiting to retry.
+void writeLCDLine(uint8_t row, const String& text) {
+  if (row == 0) pendingLine1 = formatLCDLine(text);
+  else if (row == 1) pendingLine2 = formatLCDLine(text);
+}
+
+void emitLCDLine(uint8_t row, const String& desired, String& written, bool full) {
+  if (full || written.length() != 16) {
+    lcd.setCursor(0, row);
+    lcd.print(desired);
+    written = desired;
+    return;
+  }
+  int first = -1, last = -1;
+  for (int i = 0; i < 16; i++) {
+    if (written[i] != desired[i]) {
+      if (first < 0) first = i;
+      last = i;
+    }
+  }
+  if (first < 0) return;
+  // One small consecutive print replaces 16-character redraw every second.
+  lcd.setCursor(first, row);
+  lcd.print(desired.substring(first, last + 1));
+  written = desired;
+}
+
+void serviceLCD() {
+  if (!lcdReady) return;
+  const unsigned long now = millis();
+  // The buzzer relay changes once per second; do not overlap I2C with it.
+  if ((unsigned long)(now - lastRelayTransitionMs) < LCD_RELAY_QUIET_MS) return;
+
+  if ((unsigned long)(now - lastLCDProbeMs) >= LCD_PROBE_MS) {
+    lastLCDProbeMs = now;
+    Wire.beginTransmission(lcdI2CAddress);
+    uint8_t status = Wire.endTransmission();
+    if (status != 0) {
+      lcdOnline = false;
+      if (lcdConsecutiveProbeFailures < 255) lcdConsecutiveProbeFailures++;
+      if (lcdConsecutiveProbeFailures == 3) {
+        // Reopen I2C after persistent NACKs.  This is not a power-cycle.
+        Wire.end();
+        Wire.begin();
+        Wire.setClock(50000);
+        Serial.println("[LCD] I2C unavailable: restarted Wire bus; check cables/power.");
+      }
+      return;
+    }
+    lcdConsecutiveProbeFailures = 0;
+    if (!lcdOnline) {
+      lcdOnline = true;
+      lcd.init();
+      lcd.backlight();
+      lastLine1 = "";
+      lastLine2 = "";
+      lastLCDRecoveryMs = now;
+      Serial.println("[LCD] I2C LCD reconnected and initialized.");
+    }
+  }
+  if (!lcdOnline) return;
+
+  if ((unsigned long)(now - lastLCDRecoveryMs) >= LCD_RECOVERY_MS) {
+    // LCD logic can be scrambled even while the I2C backpack still ACKs.
+    lcd.init();
+    lcd.backlight();
+    lastLine1 = "";
+    lastLine2 = "";
+    lastLCDRecoveryMs = now;
+  }
+  bool forceRefresh = ((unsigned long)(now - lastLCDRefreshMs) >= LCD_REFRESH_MS);
+  if (!forceRefresh && pendingLine1 == lastLine1 && pendingLine2 == lastLine2) return;
+  if (!lcdSetupPhase && (unsigned long)(now - lastLCDWriteMs) < LCD_MIN_WRITE_MS) return;
+
+  emitLCDLine(0, pendingLine1, lastLine1, forceRefresh);
+  emitLCDLine(1, pendingLine2, lastLine2, forceRefresh);
+  lastLCDWriteMs = millis();
+  if (forceRefresh) lastLCDRefreshMs = lastLCDWriteMs;
+}
+
+void updateDisplay(const String& line1, const String& line2) {
   writeLCDLine(0, line1);
   writeLCDLine(1, line2);
+  // During setup(), loop() isn't servicing the LCD yet. Preserve boot messages.
+  if (lcdSetupPhase) serviceLCD();
+}
+
+void recoverLCDIfNeeded() {
+  serviceLCD();
 }
 
 void scheduleIdleScreen(unsigned long delayMs = 3500) {
@@ -290,12 +416,12 @@ void notifyESP32Vibrate(bool start = true) {
 // ── Solenoid Relay Controllers (Drawer 1 on Pin 8, Drawer 2 on Pin 9) ───────
 void unlockDrawer(int drawerNum) {
   if (drawerNum == 1 || drawerNum == 0) {
-    digitalWrite(SOLENOID_DRAWER1_PIN, SOLENOID_ON);
+    writeRelayQuietly(SOLENOID_DRAWER1_PIN, SOLENOID_ON);
     solenoid1PulseActive = false;
     Serial.println("[ARDUINO] Solenoid Relay 1 (Drawer 1 / Pin 8) UNLOCKED.");
   }
   if (drawerNum == 2 || drawerNum == 0) {
-    digitalWrite(SOLENOID_DRAWER2_PIN, SOLENOID_ON);
+    writeRelayQuietly(SOLENOID_DRAWER2_PIN, SOLENOID_ON);
     solenoid2PulseActive = false;
     Serial.println("[ARDUINO] Solenoid Relay 2 (Drawer 2 / Pin 9) UNLOCKED.");
   }
@@ -303,12 +429,12 @@ void unlockDrawer(int drawerNum) {
 
 void lockDrawer(int drawerNum) {
   if (drawerNum == 1 || drawerNum == 0) {
-    digitalWrite(SOLENOID_DRAWER1_PIN, SOLENOID_OFF);
+    writeRelayQuietly(SOLENOID_DRAWER1_PIN, SOLENOID_OFF);
     solenoid1PulseActive = false;
     Serial.println("[ARDUINO] Solenoid Relay 1 (Drawer 1 / Pin 8) LOCKED.");
   }
   if (drawerNum == 2 || drawerNum == 0) {
-    digitalWrite(SOLENOID_DRAWER2_PIN, SOLENOID_OFF);
+    writeRelayQuietly(SOLENOID_DRAWER2_PIN, SOLENOID_OFF);
     solenoid2PulseActive = false;
     Serial.println("[ARDUINO] Solenoid Relay 2 (Drawer 2 / Pin 9) LOCKED.");
   }
@@ -316,13 +442,15 @@ void lockDrawer(int drawerNum) {
 
 // ── Add Compartment to Active Alert List ──────────────────────────────────────
 void startAlert(const String& rawComp, int drawerNum = 1) {
+  bool addedNew = false;
   String remaining = rawComp;
   remaining.trim();
 
   // Split multiple compartments if separated by commas or semicolons
   while (remaining.length() > 0) {
     int sepIdx = remaining.indexOf(',');
-    if (sepIdx == -1) sepIdx = remaining.indexOf(';');
+    int semiIdx = remaining.indexOf(';');
+    if (sepIdx == -1 || (semiIdx >= 0 && semiIdx < sepIdx)) sepIdx = semiIdx;
     String token = (sepIdx != -1) ? remaining.substring(0, sepIdx) : remaining;
     if (sepIdx != -1) remaining = remaining.substring(sepIdx + 1);
     else remaining = "";
@@ -346,12 +474,16 @@ void startAlert(const String& rawComp, int drawerNum = 1) {
       }
     }
 
+    if (!alreadyExists && alertCount >= MAX_ACTIVE_ALERTS) {
+      Serial.println("[ARDUINO] WARNING: Too many simultaneous alerts; new slot not queued.");
+    }
     if (!alreadyExists && alertCount < MAX_ACTIVE_ALERTS) {
       activeAlerts[alertCount].shortLabel = shortLabel;
       activeAlerts[alertCount].fullName = token;
       activeAlerts[alertCount].drawer = drw;
       activeAlerts[alertCount].taken = false;
       alertCount++;
+      addedNew = true;
 
       // Unlock ONLY the corresponding drawer solenoid relay
       unlockDrawer(drw);
@@ -366,23 +498,38 @@ void startAlert(const String& rawComp, int drawerNum = 1) {
 
   // Start 20-minute countdown and 2-minute buzzer if not already alerting
   if (!isAlertActive && alertCount > 0) {
+    startupBeepActive = false;  // Genuine scheduled dose takes priority over boot beep.
     isAlertActive = true;
     lastDoseTaken = false;
     alertStartTime = millis();
+    buzzerStartTime = alertStartTime;
 
     // Start Buzzer Relay (Will automatically stop after 2 minutes)
+    buzzerMutedByDrawer = false;
     buzzerState = true;
-    digitalWrite(BUZZER_RELAY_PIN, RELAY_ON);
+    writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_ON);
     lastBuzzerToggle = millis();
 
     currentDisplayIdx = 0;
-    lastDisplayCycleMs = millis();
-    lastCountdownUpdate = millis();
+    lastDisplayCycleMs = millis() - DISPLAY_CYCLE_INTERVAL_MS;
+    lastCountdownUpdate = millis() - 1000UL;
 
     // Trigger ESP32 Vibration over Serial UART & Wi-Fi
     notifyESP32Vibrate(true);
 
     Serial.println("[ARDUINO] 20-Minute Alert Window Activated. Buzzer active for 2 minutes.");
+  } else if (isAlertActive && addedNew) {
+    // Another schedule became due while an earlier dose is waiting. Preserve
+    // the original shared 20-minute grace timer, but restart ONLY the buzzer's
+    // 2-minute window so this newly due dose also rings for 2 minutes.
+    startupBeepActive = false;
+    buzzerStartTime = millis();
+    lastBuzzerToggle = buzzerStartTime;
+    buzzerMutedByDrawer = drawer1IsOpen || drawer2IsOpen;
+    buzzerState = !buzzerMutedByDrawer;
+    writeRelayQuietly(BUZZER_RELAY_PIN, buzzerState ? RELAY_ON : RELAY_OFF);
+    notifyESP32Vibrate(true);
+    Serial.println("[ARDUINO] Additional dose due: 2-minute scheduled buzzer window restarted.");
   }
 }
 
@@ -435,8 +582,9 @@ void resolveDoseTaken(int drawerNum) {
     lastDoseTakenMillis = millis();
     lastDoseTakenDrawer = drawerNum;
     lastTakenSummary = takenSummary;
-    digitalWrite(BUZZER_RELAY_PIN, RELAY_OFF);
+    writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
     buzzerState = false;
+    buzzerMutedByDrawer = false;
 
     // Silence ESP32 vibration
     notifyESP32Vibrate(false);
@@ -465,9 +613,10 @@ void resolveDoseMissed() {
   isAlertActive = false;
 
   // Silence buzzer & lock both solenoid relays
-  digitalWrite(BUZZER_RELAY_PIN, RELAY_OFF);
+  writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
   lockDrawer(0);
   buzzerState = false;
+  buzzerMutedByDrawer = false;
 
   // Silence ESP32 vibration
   notifyESP32Vibrate(false);
@@ -491,23 +640,24 @@ void resolveDoseMissed() {
 
 // ── Non-Blocking Manual Dispense Pulse (5 Seconds) ───────────────────────────
 void triggerDispenseSolenoid(unsigned long durationMs = 5000, int drawerNum = 0) {
+  startupBeepActive = false;
   Serial.print("[ARDUINO] Manual Solenoid Relay Unlock Triggered for Drawer ");
   Serial.println(drawerNum == 0 ? "1 & 2" : String(drawerNum));
 
   updateDisplay("UNLOCKED (5s)", drawerNum == 0 ? "Drw 1 & 2 Relays" : ("Drw " + String(drawerNum) + " Relay"));
 
   if (drawerNum == 1 || drawerNum == 0) {
-    digitalWrite(SOLENOID_DRAWER1_PIN, SOLENOID_ON);
+    writeRelayQuietly(SOLENOID_DRAWER1_PIN, SOLENOID_ON);
     solenoid1OffTime = millis() + durationMs;
     solenoid1PulseActive = true;
   }
   if (drawerNum == 2 || drawerNum == 0) {
-    digitalWrite(SOLENOID_DRAWER2_PIN, SOLENOID_ON);
+    writeRelayQuietly(SOLENOID_DRAWER2_PIN, SOLENOID_ON);
     solenoid2OffTime = millis() + durationMs;
     solenoid2PulseActive = true;
   }
 
-  digitalWrite(BUZZER_RELAY_PIN, RELAY_ON);
+  writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_ON);
   buzzerPulseOffTime = millis() + 400; // 400ms chirp
   buzzerPulseActive = true;
 
@@ -516,10 +666,11 @@ void triggerDispenseSolenoid(unsigned long durationMs = 5000, int drawerNum = 0)
 
 // ── Non-Blocking Buzzer Pulse (2 Seconds) ────────────────────────────────────
 void triggerBuzzerRelay(unsigned long durationMs = 2000) {
+  startupBeepActive = false;
   Serial.println("[ARDUINO] Buzzer Test Sounding (2s)");
   updateDisplay("BUZZER TEST", "Active 2s...");
 
-  digitalWrite(BUZZER_RELAY_PIN, RELAY_ON);
+  writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_ON);
   buzzerPulseOffTime = millis() + durationMs;
   buzzerPulseActive = true;
 
@@ -645,7 +796,8 @@ void checkMagneticReedSwitches() {
         if (isAlertActive) {
           // Patient opened drawer during alert: silence buzzer for retrieval
           buzzerState = false;
-          digitalWrite(BUZZER_RELAY_PIN, RELAY_OFF);
+          buzzerMutedByDrawer = true;
+          writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
           updateDisplay("DRAWER 1 OPEN", "Retrieve Dose :)");
         }
       } else {
@@ -677,7 +829,8 @@ void checkMagneticReedSwitches() {
         notifyDrawerDoor(2, true);
         if (isAlertActive) {
           buzzerState = false;
-          digitalWrite(BUZZER_RELAY_PIN, RELAY_OFF);
+          buzzerMutedByDrawer = true;
+          writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
           updateDisplay("DRAWER 2 OPEN", "Retrieve Dose :)");
         }
       } else {
@@ -743,9 +896,10 @@ void processSerialCommand(const String& cmd) {
   else if (cmd == "STOP" || cmd == "SILENCE" || cmd == "CLEAR") {
     isAlertActive = false;
     alertCount = 0;
-    digitalWrite(BUZZER_RELAY_PIN, RELAY_OFF);
+    writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
     lockDrawer(0); // Relock both solenoid relays
     buzzerState = false;
+    buzzerMutedByDrawer = false;
     updateDisplay("Alert Stopped", "Smart Dispenser");
     scheduleIdleScreen(2000);
   }
@@ -825,14 +979,14 @@ void setup() {
   Serial.setTimeout(50); // Fast timeout to prevent blocking on partial serial lines
 
   // 1. Initialize Buzzer Relay Pin (GPIO 7 - Active-LOW)
-  digitalWrite(BUZZER_RELAY_PIN, RELAY_OFF);
+  writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
   pinMode(BUZZER_RELAY_PIN, OUTPUT);
 
   // 2. Initialize Dual Solenoid Relay Pins (Pin 8 for Drawer 1, Pin 9 for Drawer 2 - Active-LOW)
-  digitalWrite(SOLENOID_DRAWER1_PIN, SOLENOID_OFF);
+  writeRelayQuietly(SOLENOID_DRAWER1_PIN, SOLENOID_OFF);
   pinMode(SOLENOID_DRAWER1_PIN, OUTPUT);
 
-  digitalWrite(SOLENOID_DRAWER2_PIN, SOLENOID_OFF);
+  writeRelayQuietly(SOLENOID_DRAWER2_PIN, SOLENOID_OFF);
   pinMode(SOLENOID_DRAWER2_PIN, OUTPUT);
 
   // 3. Initialize Status LED (GPIO 13)
@@ -857,7 +1011,7 @@ void setup() {
 
   // 5. Initialize I2C LCD Display (Auto-detect address 0x27 or 0x3F)
   Wire.begin();
-  Wire.setClock(100000); // Standard 100kHz I2C clock for glitch-free LCD communication
+  Wire.setClock(50000); // Conservative 50kHz for noisy / long I2C wiring
   byte lcdAddr = 0x27;
   Wire.beginTransmission(0x27);
   if (Wire.endTransmission() != 0) {
@@ -866,9 +1020,13 @@ void setup() {
       lcdAddr = 0x3F;
     }
   }
+  lcdI2CAddress = lcdAddr;
   lcd = LiquidCrystal_I2C(lcdAddr, 16, 2);
   lcd.init();
   lcd.backlight();
+  lcdReady = true;
+  lastLCDRecoveryMs = millis();
+  lastLCDProbeMs = millis();
   updateDisplay("Smart Dispenser", "Initializing...");
 
   delay(600);
@@ -921,6 +1079,16 @@ void setup() {
 #endif
 
   showIdleScreen();
+  lcdSetupPhase = false;
+
+  // Startup buzzer is an independent 10-second notification, NOT a dose alert.
+  // Running it in loop() avoids delaying reed switches, HTTP, and UART commands.
+  startupBeepActive = true;
+  startupBeepStartMs = millis();
+  lastBuzzerToggle = startupBeepStartMs;
+  buzzerState = true;
+  writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_ON);
+  Serial.println("[ARDUINO] Startup beep: 10 seconds maximum; scheduled alerts still beep 2 minutes.");
   Serial.println("[ARDUINO] Ready! Dual Solenoid Relays (Pin 8 & 9) + Reed Switches (Pin 2 & 3).");
 }
 
@@ -938,7 +1106,23 @@ void loop() {
   // 2. Monitor Magnetic Reed Switches (Detects physical drawer retrieval)
   checkMagneticReedSwitches();
 
-  // 3. Active 20-Minute Alert State Machine & 2-Minute Buzzer Cutoff
+  // 3. Startup notification (10 seconds max, 1s ON / 1s OFF).
+  // A real scheduled alert cancels this and uses its separate 2-minute timer.
+  if (startupBeepActive && !isAlertActive && !buzzerPulseActive) {
+    unsigned long now = millis();
+    if (now - startupBeepStartMs >= STARTUP_BEEP_MS) {
+      startupBeepActive = false;
+      buzzerState = false;
+      writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
+      Serial.println("[ARDUINO] Startup 10-second beep finished.");
+    } else if (now - lastBuzzerToggle >= (buzzerState ? BUZZER_BEEP_MS : BUZZER_PAUSE_MS)) {
+      buzzerState = !buzzerState;
+      lastBuzzerToggle = now;
+      writeRelayQuietly(BUZZER_RELAY_PIN, buzzerState ? RELAY_ON : RELAY_OFF);
+    }
+  }
+
+  // 4. Active 20-Minute Alert State Machine & 2-Minute Buzzer Cutoff
   if (isAlertActive) {
     unsigned long elapsed = millis() - alertStartTime;
 
@@ -949,21 +1133,21 @@ void loop() {
       unsigned long now = millis();
 
       // B. Buzzer Beeps ONLY for the first 2 minutes (120,000 ms)
-      if (elapsed < BUZZER_DURATION_MS) {
+      if (!buzzerMutedByDrawer && (now - buzzerStartTime) < BUZZER_DURATION_MS) {
         if (buzzerState && (now - lastBuzzerToggle >= BUZZER_BEEP_MS)) {
           buzzerState = false;
-          digitalWrite(BUZZER_RELAY_PIN, RELAY_OFF);
+          writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
           lastBuzzerToggle = now;
         } else if (!buzzerState && (now - lastBuzzerToggle >= BUZZER_PAUSE_MS)) {
           buzzerState = true;
-          digitalWrite(BUZZER_RELAY_PIN, RELAY_ON);
+          writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_ON);
           lastBuzzerToggle = now;
         }
       } else {
-        // 2-minute buzzer cutoff reached -> keep buzzer quiet
+        // Scheduled 2-minute buzzer cutoff reached or drawer was opened.
         if (buzzerState) {
           buzzerState = false;
-          digitalWrite(BUZZER_RELAY_PIN, RELAY_OFF);
+          writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
           Serial.println("[ARDUINO] 2-Minute Buzzing Timeout: Buzzer silenced. Alert & countdown continuing on LCD.");
         }
       }
@@ -1035,6 +1219,9 @@ void loop() {
     }
   }
 
+  // Self-recover an I2C LCD whose controller got confused by transient noise.
+  recoverLCDIfNeeded();
+
   // 4. Handle Independent Non-Blocking Solenoid Relock Pulses
   if (solenoid1PulseActive && millis() >= solenoid1OffTime) {
     bool drw1StillAlerting = false;
@@ -1047,7 +1234,7 @@ void loop() {
       }
     }
     if (!drw1StillAlerting) {
-      digitalWrite(SOLENOID_DRAWER1_PIN, SOLENOID_OFF);
+      writeRelayQuietly(SOLENOID_DRAWER1_PIN, SOLENOID_OFF);
       solenoid1PulseActive = false;
       Serial.println("[ARDUINO] Solenoid Relay 1 (Drawer 1 / Pin 8) Relocked.");
     }
@@ -1064,7 +1251,7 @@ void loop() {
       }
     }
     if (!drw2StillAlerting) {
-      digitalWrite(SOLENOID_DRAWER2_PIN, SOLENOID_OFF);
+      writeRelayQuietly(SOLENOID_DRAWER2_PIN, SOLENOID_OFF);
       solenoid2PulseActive = false;
       Serial.println("[ARDUINO] Solenoid Relay 2 (Drawer 2 / Pin 9) Relocked.");
     }
@@ -1073,7 +1260,7 @@ void loop() {
   // 5. Handle Non-Blocking Buzzer Pulse (Manual tests)
   if (buzzerPulseActive && !isAlertActive && millis() >= buzzerPulseOffTime) {
     buzzerPulseActive = false;
-    digitalWrite(BUZZER_RELAY_PIN, RELAY_OFF);
+    writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
   }
 
   // 6. LCD Auto-Reset to Idle Screen
@@ -1130,39 +1317,53 @@ void loop() {
       int curMin  = (localEpoch % 3600) / 60;
       bool isNow = (clientBaseEpoch > 0 && h24 == curHour && m == curMin);
 
-      bool updated = false;
+      // Same compartment may have DIFFERENT schedule times. Previously, the
+      // first matching compartment was always overwritten, losing schedule 1.
+      // A supplied stable id identifies an edit; without an id, only an exact
+      // drawer+compartment+time match is treated as duplicate/retransmission.
+      String scheduleId = urlDecode(getQueryParam(req, "id"));
+      if (scheduleId.length() == 0) scheduleId = urlDecode(getQueryParam(req, "scheduleId"));
+      String canonicalComp = comp.length() > 0 ? comp : (drw == 2 ? "Drawer 2 (A1)" : "Drawer 1 (A1)");
+      int foundSchedule = -1;
       for (int i = 0; i < scheduleCount; i++) {
-        if (schedules[i].compartment == comp) {
-          schedules[i].hour = h24;
-          schedules[i].minute = m;
-          schedules[i].drawer = drw;
-          schedules[i].alertedToday = isNow; // Suppress immediate trigger if saved during current minute
-          schedules[i].active = true;
-          updated = true;
+        if (scheduleId.length() > 0 && schedules[i].scheduleId == scheduleId) {
+          foundSchedule = i;
+          break;
+        }
+        if (scheduleId.length() == 0 && schedules[i].drawer == drw &&
+            schedules[i].compartment.equalsIgnoreCase(canonicalComp.c_str()) &&
+            schedules[i].hour == h24 && schedules[i].minute == m) {
+          foundSchedule = i;
           break;
         }
       }
-      if (!updated && scheduleCount < MAX_ARDUINO_SCHEDULES) {
-        schedules[scheduleCount].hour = h24;
-        schedules[scheduleCount].minute = m;
-        schedules[scheduleCount].compartment = comp.length() > 0 ? comp : (drw == 2 ? "Drawer 2 (A1)" : "Drawer 1 (A1)");
-        schedules[scheduleCount].drawer = drw;
-        schedules[scheduleCount].alertedToday = isNow; // Suppress immediate trigger if saved during current minute
-        schedules[scheduleCount].active = true;
-        scheduleCount++;
+      bool saved = true;
+      if (foundSchedule < 0) {
+        if (scheduleCount < MAX_ARDUINO_SCHEDULES) foundSchedule = scheduleCount++;
+        else saved = false;
+      }
+      if (saved) {
+        ArduinoSchedule& target = schedules[foundSchedule];
+        target.hour = h24;
+        target.minute = m;
+        target.compartment = canonicalComp;
+        target.drawer = drw;
+        target.scheduleId = scheduleId;
+        target.alertedToday = isNow; // Original: no immediate trigger when saved at due time.
+        target.active = true;
       }
 
       char dispTime[17];
       snprintf(dispTime, sizeof(dispTime), "%02d:%02d %s", h, m, amPm.c_str());
-      updateDisplay("Schedule Saved!", String(dispTime));
+      updateDisplay(saved ? "Schedule Saved!" : "Schedule FULL!", String(dispTime));
       scheduleIdleScreen(3000);
 
-      client.println("HTTP/1.1 200 OK");
+      client.println(saved ? "HTTP/1.1 200 OK" : "HTTP/1.1 507 Insufficient Storage");
       client.println("Content-Type: application/json");
       client.println("Connection: close");
       client.println("Access-Control-Allow-Origin: *");
       client.println();
-      client.println("{\"status\":\"ok\",\"drawer\":" + String(drw) + "}");
+      client.println(saved ? ("{\"status\":\"ok\",\"drawer\":" + String(drw) + "}") : "{\"status\":\"error\",\"message\":\"schedule capacity reached\"}");
       delay(10);
       client.stop();
     }
