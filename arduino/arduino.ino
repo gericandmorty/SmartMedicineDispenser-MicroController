@@ -53,9 +53,16 @@
 #endif
 
 #if HAS_WIFI
+  #include <WiFiUdp.h>
   const char* ssid = "Hi";            // Matching ESP1, ESP2, & ESP32-Mini
   const char* pass = "estogs000";
   WiFiServer server(80);
+  WiFiUDP udpDiscovery;
+  const unsigned int UDP_DISCOVERY_PORT = 4210;
+  IPAddress esp1IP = INADDR_NONE;
+  IPAddress esp2IP = INADDR_NONE;
+  IPAddress esp32IP = INADDR_NONE;
+  unsigned long lastDiscoveryBeacon = 0;
 
   const char* wifiStatusToString(int status) {
     switch (status) {
@@ -139,6 +146,12 @@ unsigned long lastDebounceTime1 = 0;
 unsigned long lastDebounceTime2 = 0;
 const unsigned long DEBOUNCE_DELAY_MS = 60;
 
+// Dose Taken Reporting for Mobile App Status
+bool lastDoseTaken = false;
+unsigned long lastDoseTakenMillis = 0;
+int lastDoseTakenDrawer = 0;
+String lastTakenSummary = "";
+
 // LCD Display & Idle State
 unsigned long lcdResetTime = 0;
 bool lcdNeedsReset = false;
@@ -191,30 +204,87 @@ String extractShortLabel(const String& str) {
   return s.length() > 6 ? s.substring(0, 6) : s;
 }
 
-// ── Helper: Update LCD Screen (Avoid redundant redraws) ──────────────────────
+// ── Helper: Format and write a fixed 16-character line to LCD without lcd.clear() ──
+void writeLCDLine(uint8_t row, const String& text) {
+  char buf[17];
+  int len = text.length();
+  for (int i = 0; i < 16; i++) {
+    buf[i] = (i < len) ? text[i] : ' ';
+  }
+  buf[16] = '\0';
+  lcd.setCursor(0, row);
+  lcd.print(buf);
+}
+
+// ── Helper: Update LCD Screen (Avoid redundant redraws & eliminates lcd.clear() flicker/corruption) ──
 void updateDisplay(const String& line1, const String& line2) {
   if (line1 == lastLine1 && line2 == lastLine2) return;
   lastLine1 = line1;
   lastLine2 = line2;
 
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(line1.substring(0, 16));
-  lcd.setCursor(0, 1);
-  lcd.print(line2.substring(0, 16));
+  writeLCDLine(0, line1);
+  writeLCDLine(1, line2);
 }
 
 void scheduleIdleScreen(unsigned long delayMs = 3500) {
+  if (isAlertActive) return; // Never schedule idle screen during alert
   lcdResetTime = millis() + delayMs;
   lcdNeedsReset = true;
 }
 
 void showIdleScreen() {
+  if (isAlertActive) return; // Never overwrite an active alert
   if (deviceIPStr.length() > 0) {
     updateDisplay("Smart Dispenser", "IP: " + deviceIPStr);
   } else {
     updateDisplay("Smart Dispenser", "Ready & Watching");
   }
+}
+
+// ── Helper: URL Decoder (%20, +, %28, %29, etc.) ────────────────────────────
+String urlDecode(const String& input) {
+  String decoded = "";
+  for (int i = 0; i < input.length(); i++) {
+    if (input[i] == '%') {
+      if (i + 2 < input.length()) {
+        char a = input[i + 1];
+        char b = input[i + 2];
+        if (isxdigit(a) && isxdigit(b)) {
+          int valA = (a >= 'a') ? (a - 'a' + 10) : ((a >= 'A') ? (a - 'A' + 10) : (a - '0'));
+          int valB = (b >= 'a') ? (b - 'a' + 10) : ((b >= 'A') ? (b - 'A' + 10) : (b - '0'));
+          decoded += (char)(16 * valA + valB);
+          i += 2;
+          continue;
+        }
+      }
+    } else if (input[i] == '+') {
+      decoded += ' ';
+    } else {
+      decoded += input[i];
+    }
+  }
+  return decoded;
+}
+
+// ── Notify ESP32 Master to Start/Stop Vibration over Serial & Wi-Fi ──────────
+void notifyESP32Vibrate(bool start = true) {
+  // 1. Send UART command to ESP32-Mini (Works over wired bridge)
+  Serial.println(start ? "VIBRATE" : "STOP");
+
+#if HAS_WIFI
+  // 2. Also send over Wi-Fi if ESP32 IP was auto-discovered
+  if (WiFi.status() == WL_CONNECTED && esp32IP != INADDR_NONE) {
+    WiFiClient cli;
+    if (cli.connect(esp32IP, 80)) {
+      String endpoint = start ? "/vibrate?duration=60000&pulses=1" : "/stop-vibrate";
+      cli.print(String("GET ") + endpoint + " HTTP/1.1\r\n" +
+                "Host: " + esp32IP.toString() + "\r\n" +
+                "Connection: close\r\n\r\n");
+      delay(15);
+      cli.stop();
+    }
+  }
+#endif
 }
 
 // ── Solenoid Relay Controllers (Drawer 1 on Pin 8, Drawer 2 on Pin 9) ───────
@@ -260,8 +330,10 @@ void startAlert(const String& rawComp, int drawerNum = 1) {
     if (token.length() == 0) continue;
 
     int drw = drawerNum;
-    if (token.indexOf("Drawer 2") != -1 || token.indexOf("2:") == 0) drw = 2;
-    else if (token.indexOf("Drawer 1") != -1 || token.indexOf("1:") == 0) drw = 1;
+    String upperToken = token;
+    upperToken.toUpperCase();
+    if (upperToken.indexOf("DRAWER 2") != -1 || upperToken.indexOf("2:") == 0 || upperToken.indexOf("(2") != -1) drw = 2;
+    else if (upperToken.indexOf("DRAWER 1") != -1 || upperToken.indexOf("1:") == 0 || upperToken.indexOf("(1") != -1) drw = 1;
 
     String shortLabel = extractShortLabel(token);
 
@@ -281,7 +353,7 @@ void startAlert(const String& rawComp, int drawerNum = 1) {
       activeAlerts[alertCount].taken = false;
       alertCount++;
 
-      // Unlock the corresponding drawer solenoid relay
+      // Unlock ONLY the corresponding drawer solenoid relay
       unlockDrawer(drw);
 
       Serial.print("[ARDUINO] 🚨 Alert Compartment Queued: ");
@@ -295,6 +367,7 @@ void startAlert(const String& rawComp, int drawerNum = 1) {
   // Start 20-minute countdown and 2-minute buzzer if not already alerting
   if (!isAlertActive && alertCount > 0) {
     isAlertActive = true;
+    lastDoseTaken = false;
     alertStartTime = millis();
 
     // Start Buzzer Relay (Will automatically stop after 2 minutes)
@@ -305,6 +378,9 @@ void startAlert(const String& rawComp, int drawerNum = 1) {
     currentDisplayIdx = 0;
     lastDisplayCycleMs = millis();
     lastCountdownUpdate = millis();
+
+    // Trigger ESP32 Vibration over Serial UART & Wi-Fi
+    notifyESP32Vibrate(true);
 
     Serial.println("[ARDUINO] 20-Minute Alert Window Activated. Buzzer active for 2 minutes.");
   }
@@ -353,10 +429,17 @@ void resolveDoseTaken(int drawerNum) {
   }
 
   if (remainingAlerts == 0) {
-    // All doses resolved! Silence buzzer
+    // All doses resolved! Silence buzzer and stop vibration
     isAlertActive = false;
+    lastDoseTaken = true;
+    lastDoseTakenMillis = millis();
+    lastDoseTakenDrawer = drawerNum;
+    lastTakenSummary = takenSummary;
     digitalWrite(BUZZER_RELAY_PIN, RELAY_OFF);
     buzzerState = false;
+
+    // Silence ESP32 vibration
+    notifyESP32Vibrate(false);
 
     updateDisplay("DOSE TAKEN! :)", takenSummary.length() > 0 ? (takenSummary + " OK") : "Drawer Closed");
     scheduleIdleScreen(4000);
@@ -385,6 +468,9 @@ void resolveDoseMissed() {
   digitalWrite(BUZZER_RELAY_PIN, RELAY_OFF);
   lockDrawer(0);
   buzzerState = false;
+
+  // Silence ESP32 vibration
+  notifyESP32Vibrate(false);
 
   String missedList = "";
   for (int i = 0; i < alertCount; i++) {
@@ -440,9 +526,63 @@ void triggerBuzzerRelay(unsigned long durationMs = 2000) {
   scheduleIdleScreen(durationMs + 500);
 }
 
+#if HAS_WIFI
+// ── UDP Automatic Discovery Handler for Arduino Uno R4 WiFi ───────────────────
+void handleUDPDiscovery() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  unsigned long now = millis();
+
+  // 1. Periodically broadcast discovery beacon every 3 seconds to LAN
+  if (now - lastDiscoveryBeacon >= 3000) {
+    lastDiscoveryBeacon = now;
+    udpDiscovery.beginPacket(IPAddress(255, 255, 255, 255), UDP_DISCOVERY_PORT);
+    udpDiscovery.print("DISPENSER:ARDUINO_R4:80");
+    udpDiscovery.endPacket();
+  }
+
+  // 2. Listen for UDP beacons from ESP32-Mini, ESP1, ESP2, or Mobile app
+  int packetSize = udpDiscovery.parsePacket();
+  if (packetSize > 0) {
+    char buf[64];
+    int len = udpDiscovery.read(buf, sizeof(buf) - 1);
+    if (len > 0) {
+      buf[len] = '\0';
+      String msg = String(buf);
+      msg.trim();
+      IPAddress senderIP = udpDiscovery.remoteIP();
+
+      if (msg.startsWith("DISPENSER:ESP32_MASTER")) {
+        if (esp32IP != senderIP) {
+          esp32IP = senderIP;
+          Serial.print("[UDP] Discovered ESP32 Master IP: ");
+          Serial.println(esp32IP);
+        }
+      } else if (msg.startsWith("DISPENSER:ESP1")) {
+        if (esp1IP != senderIP) {
+          esp1IP = senderIP;
+          Serial.print("[UDP] Discovered ESP1 (Drawer 1) IP: ");
+          Serial.println(esp1IP);
+        }
+      } else if (msg.startsWith("DISPENSER:ESP2")) {
+        if (esp2IP != senderIP) {
+          esp2IP = senderIP;
+          Serial.print("[UDP] Discovered ESP2 (Drawer 2) IP: ");
+          Serial.println(esp2IP);
+        }
+      } else if (msg.startsWith("DISPENSER_DISCOVER")) {
+        // Direct reply to Mobile App or querying device
+        udpDiscovery.beginPacket(senderIP, udpDiscovery.remotePort());
+        udpDiscovery.print("DISPENSER:ARDUINO_R4:80");
+        udpDiscovery.endPacket();
+      }
+    }
+  }
+}
+#endif
+
 // ── Notify ESP1 / ESP2 and ESP32-Mini of Drawer Open/Close State ──────────────
 void notifyDrawerDoor(int drawer, bool isOpen) {
-  // 1. Output to Serial for ESP32-Mini bridge (Pin 0/RX & Pin 1/TX)
+  // 1. Output to Serial for debug / USB monitor
   Serial.print("DRAWER:");
   Serial.print(drawer);
   Serial.print(":");
@@ -451,10 +591,28 @@ void notifyDrawerDoor(int drawer, bool isOpen) {
 #if HAS_WIFI
   if (WiFi.status() == WL_CONNECTED) {
     WiFiClient cli;
-    const char* host = (drawer == 1) ? "dispenser-drawer1.local" : "dispenser-drawer2.local";
-    if (cli.connect(host, 80)) {
+    bool connected = false;
+    String hostStr = "";
+
+    // 1. Prefer auto-discovered IP from UDP beacons (Zero-config)
+    if (drawer == 1 && esp1IP != INADDR_NONE) {
+      connected = cli.connect(esp1IP, 80);
+      hostStr = esp1IP.toString();
+    } else if (drawer == 2 && esp2IP != INADDR_NONE) {
+      connected = cli.connect(esp2IP, 80);
+      hostStr = esp2IP.toString();
+    }
+
+    // 2. Fallback to mDNS hostname if IP not yet learned via UDP
+    if (!connected) {
+      const char* host = (drawer == 1) ? "dispenser-drawer1.local" : "dispenser-drawer2.local";
+      hostStr = String(host);
+      connected = cli.connect(host, 80);
+    }
+
+    if (connected) {
       cli.print(String("GET /door?state=") + (isOpen ? "open" : "closed") + " HTTP/1.1\r\n" +
-                "Host: " + host + "\r\n" +
+                "Host: " + hostStr + "\r\n" +
                 "Connection: close\r\n\r\n");
       delay(10);
       cli.stop();
@@ -543,23 +701,27 @@ void checkMagneticReedSwitches() {
 void processSerialCommand(const String& cmd) {
   // Format: ALERT:<compartment> (e.g. "ALERT:Drawer 1 (B1)" or "ALERT:B1, B2, B3")
   if (cmd.startsWith("ALERT:")) {
-    String comp = cmd.substring(6);
+    String comp = urlDecode(cmd.substring(6));
+    comp.trim();
+    String upperComp = comp;
+    upperComp.toUpperCase();
     int drawer = 1;
-    if (comp.indexOf("Drawer 2") != -1 || comp.indexOf("2:") == 0 || comp.indexOf("(2") != -1) {
+    if (upperComp.indexOf("DRAWER 2") != -1 || upperComp.indexOf("2:") == 0 || upperComp.indexOf("(2") != -1) {
       drawer = 2;
     }
     startAlert(comp, drawer);
   }
   else if (cmd.startsWith("DISPENSE")) {
-    int drw = 0;
-    if (cmd.indexOf(":1") != -1) drw = 1;
-    else if (cmd.indexOf(":2") != -1) drw = 2;
+    int drw = 1;
+    if (cmd.indexOf(":2") != -1) drw = 2;
+    else if (cmd.indexOf(":1") != -1) drw = 1;
     triggerDispenseSolenoid(5000, drw);
   }
   else if (cmd.startsWith("SOLENOID")) {
-    int drw = 0;
-    if (cmd.indexOf(":1") != -1) drw = 1;
-    else if (cmd.indexOf(":2") != -1) drw = 2;
+    int drw = 1;
+    if (cmd.indexOf(":2") != -1) drw = 2;
+    else if (cmd.indexOf(":1") != -1) drw = 1;
+    else if (cmd.indexOf(":0") != -1) drw = 0;
     if (cmd.indexOf("UNLOCK") != -1 || cmd.indexOf("OPEN") != -1) {
       unlockDrawer(drw);
     } else {
@@ -572,7 +734,7 @@ void processSerialCommand(const String& cmd) {
   else if (cmd.startsWith("TAKEN")) {
     String comp = cmd.length() > 6 ? cmd.substring(6) : "";
     int drw = 1;
-    if (comp.indexOf("Drawer 2") != -1) drw = 2;
+    if (comp.indexOf("Drawer 2") != -1 || comp.indexOf("DRAWER 2") != -1) drw = 2;
     resolveDoseTaken(drw);
   }
   else if (cmd.startsWith("MISSED")) {
@@ -590,8 +752,10 @@ void processSerialCommand(const String& cmd) {
   else if (cmd.startsWith("IP:")) {
     deviceIPStr = cmd.substring(3);
     deviceIPStr.trim();
-    updateDisplay("WiFi Connected!", deviceIPStr);
-    scheduleIdleScreen(5000);
+    if (!isAlertActive) {
+      updateDisplay("WiFi Connected!", deviceIPStr);
+      scheduleIdleScreen(5000);
+    }
   }
   else if (cmd.startsWith("TIME:")) {
     String timeStr = cmd.substring(5);
@@ -658,17 +822,18 @@ String getQueryParam(const String& req, const String& param) {
 // ── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
+  Serial.setTimeout(50); // Fast timeout to prevent blocking on partial serial lines
 
   // 1. Initialize Buzzer Relay Pin (GPIO 7 - Active-LOW)
-  pinMode(BUZZER_RELAY_PIN, OUTPUT);
   digitalWrite(BUZZER_RELAY_PIN, RELAY_OFF);
+  pinMode(BUZZER_RELAY_PIN, OUTPUT);
 
   // 2. Initialize Dual Solenoid Relay Pins (Pin 8 for Drawer 1, Pin 9 for Drawer 2 - Active-LOW)
-  pinMode(SOLENOID_DRAWER1_PIN, OUTPUT);
   digitalWrite(SOLENOID_DRAWER1_PIN, SOLENOID_OFF);
+  pinMode(SOLENOID_DRAWER1_PIN, OUTPUT);
 
-  pinMode(SOLENOID_DRAWER2_PIN, OUTPUT);
   digitalWrite(SOLENOID_DRAWER2_PIN, SOLENOID_OFF);
+  pinMode(SOLENOID_DRAWER2_PIN, OUTPUT);
 
   // 3. Initialize Status LED (GPIO 13)
   pinMode(STATUS_LED_PIN, OUTPUT);
@@ -692,6 +857,7 @@ void setup() {
 
   // 5. Initialize I2C LCD Display (Auto-detect address 0x27 or 0x3F)
   Wire.begin();
+  Wire.setClock(100000); // Standard 100kHz I2C clock for glitch-free LCD communication
   byte lcdAddr = 0x27;
   Wire.beginTransmission(0x27);
   if (Wire.endTransmission() != 0) {
@@ -738,10 +904,13 @@ void setup() {
 
   if (WiFi.status() == WL_CONNECTED) {
     server.begin();
+    udpDiscovery.begin(UDP_DISCOVERY_PORT);
     deviceIPStr = WiFi.localIP().toString();
     updateDisplay("WiFi Connected!", deviceIPStr);
     Serial.print("[ARDUINO] ✅ WiFi Connected! IP: ");
     Serial.println(deviceIPStr);
+    Serial.print("[ARDUINO] 🔍 UDP Auto-Discovery Beacon active on port ");
+    Serial.println(UDP_DISCOVERY_PORT);
     delay(1500);
   } else {
     updateDisplay("WiFi Offline", "Serial Link ON");
@@ -800,9 +969,11 @@ void loop() {
       }
 
       // C. Line 1: Increment / Cycle through multiple scheduled compartments every 2 seconds
-      if (now - lastDisplayCycleMs >= DISPLAY_CYCLE_INTERVAL_MS) {
+      bool shouldUpdateLine1 = false;
+      if (now - lastDisplayCycleMs >= DISPLAY_CYCLE_INTERVAL_MS || lastDisplayCycleMs == 0) {
         lastDisplayCycleMs = now;
         currentDisplayIdx++;
+        shouldUpdateLine1 = true;
       }
 
       // Count remaining untaken compartments
@@ -811,7 +982,7 @@ void loop() {
         if (!activeAlerts[i].taken) untakenCount++;
       }
 
-      if (untakenCount > 0) {
+      if (untakenCount > 0 && shouldUpdateLine1) {
         int cycleStates = (untakenCount > 1) ? (untakenCount + 1) : 1;
         int state = currentDisplayIdx % cycleStates;
 
@@ -845,11 +1016,8 @@ void loop() {
           }
         }
 
-        // Print Line 1 to LCD
-        if (line1.length() > 16) line1 = line1.substring(0, 16);
-        lcd.setCursor(0, 0);
-        lcd.print(line1);
-        for (int p = line1.length(); p < 16; p++) lcd.print(" ");
+        // Print Line 1 cleanly with space padding
+        writeLCDLine(0, line1);
       }
 
       // D. Line 2: 20-Minute Countdown Display (Updated once per second)
@@ -862,8 +1030,7 @@ void loop() {
 
         char timeBuf[17];
         snprintf(timeBuf, sizeof(timeBuf), "%02dm %02ds left", remMin, remSec);
-        lcd.setCursor(0, 1);
-        lcd.print(timeBuf);
+        writeLCDLine(1, String(timeBuf));
       }
     }
   }
@@ -919,7 +1086,10 @@ void loop() {
   checkArduinoSchedules();
 
 #if HAS_WIFI
-  // 8. Direct HTTP Server for Uno R4 WiFi
+  // 8. Auto-Discovery UDP beacon & listener for dynamic IP synchronization
+  handleUDPDiscovery();
+
+  // 9. Direct HTTP Server for Uno R4 WiFi
   WiFiClient client = server.available();
   if (client) {
     String req = client.readStringUntil('\r');
@@ -929,10 +1099,19 @@ void loop() {
       int h = getQueryParam(req, "hour").toInt();
       int m = getQueryParam(req, "minute").toInt();
       String amPm = getQueryParam(req, "amPm");
-      String comp = getQueryParam(req, "compartment");
-      comp.replace('+', ' ');
+      String rawComp = getQueryParam(req, "compartment");
+      String comp = urlDecode(rawComp);
+      comp.trim();
       String epochStr = getQueryParam(req, "client_epoch");
-      int drw = (comp.indexOf("Drawer 2") != -1) ? 2 : 1;
+      int drwParam = getQueryParam(req, "drawer").toInt();
+      int slotParam = getQueryParam(req, "slotIndex").length() > 0 ? getQueryParam(req, "slotIndex").toInt() : -1;
+
+      String upperComp = comp;
+      upperComp.toUpperCase();
+      int drw = 1;
+      if (drwParam == 2 || slotParam >= 21 || upperComp.indexOf("DRAWER 2") != -1 || upperComp.indexOf("2:") == 0 || upperComp.indexOf("(2") != -1) {
+        drw = 2;
+      }
 
       // 12h to 24h
       int h24 = h;
@@ -944,13 +1123,20 @@ void loop() {
         clientBaseMillis = millis();
       }
 
+      // Calculate current hour/minute to suppress immediate false alarm if schedule matches current time
+      unsigned long curEpoch = clientBaseEpoch + ((millis() - clientBaseMillis) / 1000);
+      unsigned long localEpoch = curEpoch + 28800UL; // GMT+8
+      int curHour = (localEpoch % 86400) / 3600;
+      int curMin  = (localEpoch % 3600) / 60;
+      bool isNow = (clientBaseEpoch > 0 && h24 == curHour && m == curMin);
+
       bool updated = false;
       for (int i = 0; i < scheduleCount; i++) {
         if (schedules[i].compartment == comp) {
           schedules[i].hour = h24;
           schedules[i].minute = m;
           schedules[i].drawer = drw;
-          schedules[i].alertedToday = false;
+          schedules[i].alertedToday = isNow; // Suppress immediate trigger if saved during current minute
           schedules[i].active = true;
           updated = true;
           break;
@@ -959,9 +1145,9 @@ void loop() {
       if (!updated && scheduleCount < MAX_ARDUINO_SCHEDULES) {
         schedules[scheduleCount].hour = h24;
         schedules[scheduleCount].minute = m;
-        schedules[scheduleCount].compartment = comp.length() > 0 ? comp : "Drawer 1 (A1)";
+        schedules[scheduleCount].compartment = comp.length() > 0 ? comp : (drw == 2 ? "Drawer 2 (A1)" : "Drawer 1 (A1)");
         schedules[scheduleCount].drawer = drw;
-        schedules[scheduleCount].alertedToday = false;
+        schedules[scheduleCount].alertedToday = isNow; // Suppress immediate trigger if saved during current minute
         schedules[scheduleCount].active = true;
         scheduleCount++;
       }
@@ -976,15 +1162,24 @@ void loop() {
       client.println("Connection: close");
       client.println("Access-Control-Allow-Origin: *");
       client.println();
-      client.println("{\"status\":\"ok\"}");
+      client.println("{\"status\":\"ok\",\"drawer\":" + String(drw) + "}");
       delay(10);
       client.stop();
     }
     else if (req.indexOf("/alert") != -1) {
-      String comp = getQueryParam(req, "compartment");
-      comp.replace('+', ' ');
-      if (comp.length() == 0) comp = "Drawer 1 (A1)";
-      int drw = (comp.indexOf("Drawer 2") != -1) ? 2 : 1;
+      String rawComp = getQueryParam(req, "compartment");
+      String comp = urlDecode(rawComp);
+      comp.trim();
+      int drwParam = getQueryParam(req, "drawer").toInt();
+      int slotParam = getQueryParam(req, "slotIndex").length() > 0 ? getQueryParam(req, "slotIndex").toInt() : -1;
+
+      String upperComp = comp;
+      upperComp.toUpperCase();
+      int drw = 1;
+      if (drwParam == 2 || slotParam >= 21 || upperComp.indexOf("DRAWER 2") != -1 || upperComp.indexOf("2:") == 0 || upperComp.indexOf("(2") != -1) {
+        drw = 2;
+      }
+      if (comp.length() == 0) comp = (drw == 2 ? "Drawer 2 (A1)" : "Drawer 1 (A1)");
 
       client.println("HTTP/1.1 200 OK");
       client.println("Content-Type: application/json");
@@ -1061,7 +1256,10 @@ void loop() {
       resolveDoseTaken(0); // Resolve all drawers
     }
     else if (req.indexOf("/status") != -1 || req.indexOf("/ping") != -1) {
-      String json = "{\"status\":\"online\",\"device\":\"Arduino-Controller\",\"is_alerting\":" + String(isAlertActive ? "true" : "false") + ",\"active_alerts\":" + String(alertCount) + ",\"schedules\":" + String(scheduleCount) + "}";
+      String json = "{\"status\":\"online\",\"device\":\"Arduino-Controller\",\"is_alerting\":" + String(isAlertActive ? "true" : "false") + ",\"active_alerts\":" + String(alertCount) + ",\"schedules\":" + String(scheduleCount) + ",\"last_dose_taken\":" + String(lastDoseTaken ? "true" : "false") + ",\"last_taken_ms_ago\":" + String(lastDoseTaken ? (millis() - lastDoseTakenMillis) : 999999) + ",\"last_taken_comp\":\"" + lastTakenSummary + "\"";
+      json += ",\"esp32_ip\":\"" + (esp32IP != INADDR_NONE ? esp32IP.toString() : "") + "\"";
+      json += ",\"esp1_ip\":\"" + (esp1IP != INADDR_NONE ? esp1IP.toString() : "") + "\"";
+      json += ",\"esp2_ip\":\"" + (esp2IP != INADDR_NONE ? esp2IP.toString() : "") + "\"}";
       client.println("HTTP/1.1 200 OK");
       client.println("Content-Type: application/json");
       client.println("Connection: close");

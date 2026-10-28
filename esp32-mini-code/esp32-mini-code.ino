@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <time.h>
@@ -7,17 +8,7 @@
 
 // ==============================================================================
 //  SMART MEDICINE DISPENSER - ESP32 MINI MASTER CONTROLLER
-//  Firmware Version: 2.0 (Full 20-Min Grace Period + Vibration + Drawer Sync)
-//
-//  Features:
-//    - Real-Time Clock with Wi-Fi NTP auto-sync (pool.ntp.org) + Mobile Epoch Sync
-//    - Vibration Motor alert system (non-blocking PWM/transistor driver on GPIO 4)
-//    - Full 20-minute countdown active alert state machine (per specification)
-//    - NVS flash storage (Preferences) persists schedules across power reboots
-//    - Drawer 1 (ESP1) & Drawer 2 (ESP2) Wi-Fi LED coordination
-//    - Arduino Serial command bridge (for 16x2 LCD display & dispense relays)
-//    - Complete REST API matching mobile_logic_verification_spec.md
-//    - Responsive Web Dashboard for direct browser control
+//  Firmware Version: 2.1 (Full 20-Min Grace Period + Auto-Discovery UDP + Wi-Fi)
 // ==============================================================================
 
 // ── Wi-Fi Configuration ──────────────────────────────────────────────────────
@@ -31,10 +22,18 @@ int daylightOffset_sec = 0;
 const char* ntpServer1 = "pool.ntp.org";
 const char* ntpServer2 = "time.nist.gov";
 
-// ── Drawer ESP & Arduino Hostnames / Endpoints ───────────────────────────────
+// ── Drawer ESP & Arduino Hostnames / Auto-Discovered Endpoints ───────────────
 const char* DRAWER1_HOST = "http://dispenser-drawer1.local";
 const char* DRAWER2_HOST = "http://dispenser-drawer2.local";
 const char* ARDUINO_HOST = "http://10.146.105.91";
+
+// Dynamic Auto-Discovered Hosts (learned via UDP Broadcasts)
+String dynamicArduinoHost = "";
+String dynamicDrawer1Host = "";
+String dynamicDrawer2Host = "";
+WiFiUDP udpDiscovery;
+const unsigned int UDP_DISCOVERY_PORT = 4210;
+unsigned long lastDiscoveryBeacon = 0;
 
 // ── Pin Configuration ────────────────────────────────────────────────────────
 #if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(ARDUINO_ESP32C3_DEV) || defined(ARDUINO_ESP32C3)
@@ -118,11 +117,13 @@ ActiveAlertState currentAlert = {
 };
 
 // ── Vibration Motor State Machine (Non-blocking) ─────────────────────────────
+const unsigned long VIBRATION_ALERT_DURATION_MS = 60000UL; // 1 minute (60,000 ms) continuous vibration
+
 bool isVibrating = false;
 int currentPulse = 0;
-int totalPulses = 3;
-unsigned long pulseOnDuration = 600;   // ms vibrating
-unsigned long pulseOffDuration = 300;  // ms pause between pulses
+int totalPulses = 1;
+unsigned long pulseOnDuration = 60000UL;  // ms vibrating (default 1 minute)
+unsigned long pulseOffDuration = 0;       // ms pause between pulses (0 for continuous)
 unsigned long vibrationStateTimer = 0;
 bool motorIsOn = false;
 
@@ -153,7 +154,7 @@ time_t getCurrentEpoch() {
 }
 
 // ── Vibration Alert Controller (Non-blocking) ────────────────────────────────
-void startVibrationAlert(int pulses = 3, unsigned long onMs = 600, unsigned long offMs = 300) {
+void startVibrationAlert(int pulses = 1, unsigned long onMs = 60000UL, unsigned long offMs = 0) {
   isVibrating = true;
   currentPulse = 0;
   totalPulses = pulses;
@@ -166,7 +167,7 @@ void startVibrationAlert(int pulses = 3, unsigned long onMs = 600, unsigned long
   if (BUZZER_PIN >= 0) digitalWrite(BUZZER_PIN, HIGH);
 
   vibrationStateTimer = millis();
-  Serial.printf("[VIBRATION] Started: %d pulses (%lu ms on / %lu ms off)\n", pulses, onMs, offMs);
+  Serial.printf("[VIBRATION] Started: %d pulse(s) (%lu ms on / %lu ms off) - 1 minute continuous vibration active\n", pulses, onMs, offMs);
 }
 
 void stopVibration() {
@@ -194,11 +195,11 @@ void updateVibrationState() {
 
       if (currentPulse >= totalPulses) {
         isVibrating = false;
-        Serial.println("[VIBRATION] Pulse sequence finished.");
+        Serial.println("[VIBRATION] 1-minute vibration finished.");
       }
     }
   } else {
-    if (now - vibrationStateTimer >= pulseOffDuration) {
+    if (pulseOffDuration > 0 && now - vibrationStateTimer >= pulseOffDuration) {
       motorIsOn = true;
       digitalWrite(VIBRATION_PIN, VIBRATION_ACTIVE);
       if (STATUS_LED_PIN >= 0) digitalWrite(STATUS_LED_PIN, LED_ACTIVE);
@@ -281,10 +282,12 @@ void notifyDrawerLED(int drawer, int slot, const String& action) {
   char sep = (action.indexOf('?') != -1) ? '&' : '?';
   String targetUrl = "";
   if (drawer == 1) {
-    targetUrl = String(DRAWER1_HOST) + "/" + action + sep + "slot=" + String(slot) + "&col=" + String(col);
+    String host = (dynamicDrawer1Host.length() > 0) ? dynamicDrawer1Host : String(DRAWER1_HOST);
+    targetUrl = host + "/" + action + sep + "slot=" + String(slot) + "&col=" + String(col);
   } else if (drawer == 2) {
+    String host = (dynamicDrawer2Host.length() > 0) ? dynamicDrawer2Host : String(DRAWER2_HOST);
     int localSlot = (slot >= 21) ? (slot - 21) : slot;
-    targetUrl = String(DRAWER2_HOST) + "/" + action + sep + "slot=" + String(localSlot) + "&col=" + String(localSlot % 7);
+    targetUrl = host + "/" + action + sep + "slot=" + String(localSlot) + "&col=" + String(localSlot % 7);
   }
 
   if (targetUrl.length() > 0) {
@@ -301,7 +304,12 @@ void notifyDrawerLED(int drawer, int slot, const String& action) {
 void notifyDrawerDoorState(int drawer, bool isOpen) {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
-  String host = (drawer == 1) ? DRAWER1_HOST : DRAWER2_HOST;
+  String host = "";
+  if (drawer == 1) {
+    host = (dynamicDrawer1Host.length() > 0) ? dynamicDrawer1Host : String(DRAWER1_HOST);
+  } else {
+    host = (dynamicDrawer2Host.length() > 0) ? dynamicDrawer2Host : String(DRAWER2_HOST);
+  }
   String url = host + "/door?state=" + (isOpen ? "open" : "closed");
   http.begin(url);
   http.setTimeout(1200);
@@ -310,9 +318,55 @@ void notifyDrawerDoorState(int drawer, bool isOpen) {
   Serial.printf("[DOOR HTTP] Drawer %d -> %s (HTTP %d)\n", drawer, isOpen ? "OPEN (LEDs ON)" : "CLOSED (LEDs OFF)", code);
 }
 
+// ── UDP Automatic Discovery Handler for ESP32 Master ──────────────────────────
+void handleUDPDiscovery() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  unsigned long now = millis();
+
+  // 1. Periodically broadcast discovery beacon every 3 seconds to LAN
+  if (now - lastDiscoveryBeacon >= 3000) {
+    lastDiscoveryBeacon = now;
+    udpDiscovery.beginPacket(IPAddress(255, 255, 255, 255), UDP_DISCOVERY_PORT);
+    udpDiscovery.print("DISPENSER:ESP32_MASTER:80");
+    udpDiscovery.endPacket();
+  }
+
+  // 2. Listen for UDP beacons from Arduino R4, ESP1, ESP2, or Mobile app
+  int packetSize = udpDiscovery.parsePacket();
+  if (packetSize > 0) {
+    char buf[64];
+    int len = udpDiscovery.read(buf, sizeof(buf) - 1);
+    if (len > 0) {
+      buf[len] = '\0';
+      String msg = String(buf);
+      msg.trim();
+      IPAddress senderIP = udpDiscovery.remoteIP();
+
+      if (msg.startsWith("DISPENSER:ARDUINO_R4")) {
+        String newHost = "http://" + senderIP.toString();
+        if (dynamicArduinoHost != newHost) {
+          dynamicArduinoHost = newHost;
+          Serial.println("[UDP] Discovered Arduino Uno R4 WiFi at: " + dynamicArduinoHost);
+        }
+      } else if (msg.startsWith("DISPENSER:ESP1")) {
+        dynamicDrawer1Host = "http://" + senderIP.toString();
+        Serial.println("[UDP] Discovered ESP1 (Drawer 1) at: " + dynamicDrawer1Host);
+      } else if (msg.startsWith("DISPENSER:ESP2")) {
+        dynamicDrawer2Host = "http://" + senderIP.toString();
+        Serial.println("[UDP] Discovered ESP2 (Drawer 2) at: " + dynamicDrawer2Host);
+      } else if (msg.startsWith("DISPENSER_DISCOVER")) {
+        // Direct reply to Mobile App query
+        udpDiscovery.beginPacket(senderIP, udpDiscovery.remotePort());
+        udpDiscovery.print("DISPENSER:ESP32_MASTER:80");
+        udpDiscovery.endPacket();
+      }
+    }
+  }
+}
+
 // ── Notify Arduino Controller over Serial & Wi-Fi ─────────────────────────────
 void notifyArduinoAlert(const String& compartment, int drawer = 1) {
-  // 1. Output to Serial for wired UART bridge
+  // 1. Output to Serial for debug / USB monitor
   Serial.printf("ALERT:%s\n", compartment.c_str());
 
   // 2. Also send HTTP command to Arduino over Wi-Fi
@@ -320,7 +374,8 @@ void notifyArduinoAlert(const String& compartment, int drawer = 1) {
     HTTPClient http;
     String encComp = compartment;
     encComp.replace(' ', '+');
-    String url = String(ARDUINO_HOST) + "/alert?compartment=" + encComp + "&drawer=" + String(drawer);
+    String host = (dynamicArduinoHost.length() > 0) ? dynamicArduinoHost : String(ARDUINO_HOST);
+    String url = host + "/alert?compartment=" + encComp + "&drawer=" + String(drawer);
     http.begin(url);
     http.setTimeout(1500);
     http.GET();
@@ -332,7 +387,8 @@ void notifyArduinoStop() {
   Serial.println("STOP");
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    http.begin(String(ARDUINO_HOST) + "/stop-vibrate");
+    String host = (dynamicArduinoHost.length() > 0) ? dynamicArduinoHost : String(ARDUINO_HOST);
+    http.begin(host + "/stop-vibrate");
     http.setTimeout(1500);
     http.GET();
     http.end();
@@ -457,7 +513,17 @@ void checkAlarms() {
 
   // Check if any schedule matches the current minute
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo, 50)) return;
+  bool gotTime = getLocalTime(&timeinfo, 50);
+  if (!gotTime) {
+    // Offline / local Wi-Fi fallback (uses phone-calibrated RTC epoch if NTP not reachable)
+    time_t now = getCurrentEpoch();
+    if (now > 100000) {
+      now += gmtOffset_sec;
+      gmtime_r(&now, &timeinfo);
+      gotTime = true;
+    }
+  }
+  if (!gotTime) return;
 
   int currentHour = timeinfo.tm_hour;
   int currentMinute = timeinfo.tm_min;
@@ -488,27 +554,31 @@ void checkAlarms() {
         lastTriggeredHour = currentHour;
         lastTriggeredDay = currentDay;
 
+        int drawer = (schedules[i].slotIndex >= 21) ? 2 : 1;
+
         // 1. Enter 20-minute Active Alert State (if not already alerting)
         if (!currentAlert.isAlerting) {
           currentAlert.isAlerting = true;
           strncpy(currentAlert.scheduleId, schedules[i].id, sizeof(currentAlert.scheduleId));
           strncpy(currentAlert.compartment, schedules[i].compartment, sizeof(currentAlert.compartment));
           currentAlert.slotIndex = schedules[i].slotIndex;
-          currentAlert.relayNum = (schedules[i].slotIndex % 4) + 1;
+          currentAlert.relayNum = drawer;
           currentAlert.alertStartEpoch = getCurrentEpoch();
           currentAlert.lastReminderVibrateMs = millis();
 
-          // 2. Start initial strong vibration pattern (3 strong pulses)
-          startVibrationAlert(3, 700, 300);
+          // 2. Start strong continuous vibration for alert (60 seconds)
+          startVibrationAlert(1, 60000UL, 0);
         }
 
         // 3. Trigger compartment LED on ESP1 (Drawer 1) or ESP2 (Drawer 2) for each scheduled item
-        int drawer = (schedules[i].slotIndex >= 21) ? 2 : 1;
         notifyDrawerLED(drawer, schedules[i].slotIndex, "alert");
 
-        // 4. Trigger Hardware Relay & Arduino Buzzer/LCD for each scheduled item
-        triggerDispenseRelay((schedules[i].slotIndex % 4) + 1);
+        // 4. Trigger Hardware Relay & Arduino Buzzer/LCD for the specific drawer
+        triggerDispenseRelay(drawer == 2 ? 3 : 1);
         notifyArduinoAlert(schedules[i].compartment, drawer);
+
+        // Reset timer so blocking HTTP calls to ESP1/ESP2 & Arduino do NOT consume vibration duration!
+        vibrationStateTimer = millis();
 
         // One-time schedule is marked inactive after firing
         if (strlen(schedules[i].date) > 0) {
@@ -543,6 +613,9 @@ void handleStatus() {
   json += "\"status\":\"online\",";
   json += "\"device\":\"ESP32-Mini-Dispenser\",";
   json += "\"ip\":\"" + activeIP + "\",";
+  json += "\"arduino_ip\":\"" + (dynamicArduinoHost.length() > 0 ? dynamicArduinoHost : String(ARDUINO_HOST)) + "\",";
+  json += "\"drawer1_ip\":\"" + (dynamicDrawer1Host.length() > 0 ? dynamicDrawer1Host : String(DRAWER1_HOST)) + "\",";
+  json += "\"drawer2_ip\":\"" + (dynamicDrawer2Host.length() > 0 ? dynamicDrawer2Host : String(DRAWER2_HOST)) + "\",";
   json += "\"device_time\":\"" + getCurrentTimeString() + "\",";
   json += "\"schedules_count\":" + String(scheduleCount) + ",";
   json += "\"is_vibrating\":" + String(isVibrating ? "true" : "false") + ",";
@@ -622,17 +695,45 @@ void handleStopVibrate() {
 // GET/POST /vibrate
 void handleVibrate() {
   sendCORSHeaders();
-  int duration = 2500;
-  int pulses = 3;
+  int duration = 60000; // Default 1 minute continuous vibration on due
+  int pulses = 1;
 
   if (server.hasArg("duration")) duration = server.arg("duration").toInt();
   if (server.hasArg("pulses")) pulses = server.arg("pulses").toInt();
 
-  unsigned long onMs = duration / (pulses > 0 ? pulses : 1);
-  if (onMs > 1000) onMs = 700;
+  unsigned long onMs = (pulses > 1) ? (duration / pulses) : duration;
+  if (pulses > 1 && onMs > 1000) onMs = 700;
+  unsigned long offMs = (pulses > 1) ? 250 : 0;
 
-  startVibrationAlert(pulses, onMs, 250);
-  server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"vibrating\",\"pulses\":" + String(pulses) + "}");
+  startVibrationAlert(pulses, onMs, offMs);
+  server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"vibrating\",\"pulses\":" + String(pulses) + ",\"duration\":" + String(duration) + "}");
+}
+
+// GET/POST /alert (Triggered by mobile watchdog or Arduino over Wi-Fi)
+void handleAlert() {
+  sendCORSHeaders();
+  String comp = server.hasArg("compartment") ? server.arg("compartment") : "Drawer 1 (A1)";
+  int drw = 1;
+  if (server.hasArg("drawer")) drw = server.arg("drawer").toInt();
+  else if (comp.indexOf("Drawer 2") != -1 || comp.indexOf("2:") == 0) drw = 2;
+
+  int slot = (drw == 2) ? 21 : 0;
+  if (server.hasArg("slotIndex")) slot = server.arg("slotIndex").toInt();
+
+  if (!currentAlert.isAlerting) {
+    currentAlert.isAlerting = true;
+    strncpy(currentAlert.scheduleId, "remote_alert", sizeof(currentAlert.scheduleId));
+    strncpy(currentAlert.compartment, comp.c_str(), sizeof(currentAlert.compartment));
+    currentAlert.slotIndex = slot;
+    currentAlert.relayNum = (drw == 2) ? 3 : 1;
+    currentAlert.alertStartEpoch = getCurrentEpoch();
+    currentAlert.lastReminderVibrateMs = millis();
+  }
+
+  // Start continuous 1-minute vibration alert
+  startVibrationAlert(1, 60000UL, 0);
+  Serial.printf("[ALERT] Hardware alert received for %s (Drawer %d) -> Vibration active (60s)\n", comp.c_str(), drw);
+  server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"alert_started\",\"drawer\":" + String(drw) + ",\"vibrating\":true}");
 }
 
 // GET/POST /solenoid?drawer=1&state=unlock (or lock)
@@ -713,9 +814,6 @@ void handleSetSchedule() {
   }
 
   bool success = addOrUpdateSchedule(id.c_str(), hour, minute, date.c_str(), compartment.c_str(), slotIndex);
-
-  // Quick vibration confirmation beep
-  startVibrationAlert(1, 200, 100);
 
   // Notify drawer LED to turn Green (Active Schedule)
   int drawer = (slotIndex >= 21) ? 2 : 1;
@@ -889,6 +987,8 @@ void setup() {
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/ping", HTTP_GET, handleStatus);
   server.on("/events", HTTP_GET, handleEvents);
+  server.on("/alert", HTTP_GET, handleAlert);
+  server.on("/alert", HTTP_POST, handleAlert);
   server.on("/vibrate", HTTP_GET, handleVibrate);
   server.on("/vibrate", HTTP_POST, handleVibrate);
   server.on("/stop-vibrate", HTTP_GET, handleStopVibrate);
@@ -902,13 +1002,15 @@ void setup() {
   server.on("/schedules", HTTP_GET, handleGetSchedules);
   server.on("/test-alert", HTTP_GET, handleTestAlert);
 
+  server.on("/alert", HTTP_OPTIONS, handleOptions);
   server.on("/solenoid", HTTP_OPTIONS, handleOptions);
   server.on("/vibrate", HTTP_OPTIONS, handleOptions);
   server.on("/stop-vibrate", HTTP_OPTIONS, handleOptions);
   server.on("/set-schedule", HTTP_OPTIONS, handleOptions);
 
   server.begin();
-  Serial.println("[HTTP] Server listening on port 80");
+  udpDiscovery.begin(UDP_DISCOVERY_PORT);
+  Serial.printf("[HTTP] Server listening on port 80\n[UDP] Auto-Discovery Beacon active on port %d\n", UDP_DISCOVERY_PORT);
 }
 
 // ── Handle Serial Messages from Arduino or Serial Monitor ───────────────────
@@ -960,6 +1062,7 @@ void handleSerialFromArduino() {
 // ── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
   server.handleClient();
+  handleUDPDiscovery();
   updateVibrationState();
   updateDispenserState();
   checkAlarms();
