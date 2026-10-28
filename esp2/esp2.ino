@@ -1,7 +1,12 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+
+WiFiUDP udpDiscovery;
+const unsigned int UDP_DISCOVERY_PORT = 4210;
+unsigned long lastDiscoveryBeacon = 0;
 
 // ==============================================================================
 //  SMART MEDICINE DISPENSER - ESP2 FIRMWARE (DRAWER 2: 21 DISCRETE LEDs)
@@ -592,7 +597,8 @@ void setup() {
   server.on("/led", HTTP_OPTIONS, handleOptions);
 
   server.begin();
-  Serial.println("[HTTP] Server listening on port 80");
+  udpDiscovery.begin(UDP_DISCOVERY_PORT);
+  Serial.printf("[HTTP] Server listening on port 80\n[UDP] Auto-Discovery active on port %d\n", UDP_DISCOVERY_PORT);
 
   // Visual startup verification sweep
   runStartupAnimation();
@@ -603,6 +609,14 @@ void loop() {
   server.handleClient();
   updateLEDState();
   handleSerialCommands();
+
+  // Broadcast UDP discovery beacon every 3s so Arduino and ESP32 know ESP2 IP
+  if (WiFi.status() == WL_CONNECTED && (millis() - lastDiscoveryBeacon >= 3000)) {
+    lastDiscoveryBeacon = millis();
+    udpDiscovery.beginPacket(IPAddress(255, 255, 255, 255), UDP_DISCOVERY_PORT);
+    udpDiscovery.print("DISPENSER:ESP2:80");
+    udpDiscovery.endPacket();
+  }
 
   // Reconnect Wi-Fi if connection drops
   static unsigned long lastReconnectCheck = 0;
