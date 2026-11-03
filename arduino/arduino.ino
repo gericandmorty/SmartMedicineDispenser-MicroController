@@ -1,6 +1,6 @@
 // ==============================================================================
 //  SMART MEDICINE DISPENSER - ARDUINO CONTROLLER (UNO R3 / UNO R4 WiFi)
-//  Firmware Version: 3.3.3 (LCD stability patch; pins and alert logic retained)
+//  Firmware Version: 3.4.0 (20-minute buzzer; one current dose; dated schedules)
 // ==============================================================================
 //  Hardware Setup:
 //    1. I2C LCD 16x2 Display:
@@ -9,7 +9,7 @@
 //       - Auto-detects I2C Address: 0x27 or 0x3F
 //
 //    2. Buzzer Relay Module (1 GPIO):
-//       - Pin 7 -> Relay IN (1s BEEP / 1s PAUSE, 2-Minute Maximum Duration)
+//       - Pin 7 -> Relay IN (1s BEEP / 1s PAUSE, 20-Minute Maximum Duration)
 //
 //    3. Dual Solenoid Locks (Connected to Relay Module - Active-LOW):
 //       - Pin 8 -> Relay IN (Controls Solenoid Lock for Drawer 1)
@@ -30,14 +30,14 @@
 //       - When Drawer 2 is due: Pin 9 Relay activates to unlock Drawer 2 solenoid.
 //       - When Drawer 1 is pulled open: Pin 8 Relay locks after 3s.
 //       - When Drawer 2 is pulled open: Pin 9 Relay locks after 3s.
-//    2. 2-Minute Buzzer Cutoff:
-//       - Buzzer beeps (1s ON / 1s OFF) for 2 minutes max, then silences.
-//       - 20-minute alert grace period & live countdown on LCD continues.
+//    2. 20-Minute Buzzer Cutoff:
+//       - Buzzer beeps (1s ON / 1s OFF) for 20 minutes max, then silences.
+//       - 20-minute alert grace period and live countdown share the buzzer limit.
 //    3. Magnetic Reed Switch & LED Behavior:
 //       - Drawer 1 Reed Switch (Pin 2) controls ESP1 LEDs (Drawer 1 Matrix).
 //       - Drawer 2 Reed Switch (Pin 3) controls ESP2 LEDs (Drawer 2 Matrix).
 //       - When reed switch is CLOSED: LEDs on ESP1 / ESP2 will NOT lit up (allOff).
-//       - When reed switch is OPEN: LEDs on ESP1 / ESP2 will lit up (only for scheduled/alerting cells).
+//       - When reed switch is OPEN: Only the current due compartment LED can light on ESP1 / ESP2.
 //       - When drawer is pulled open during an alert: Buzzer silences, dose is taken on drawer close, and LEDs stay illuminated while open.
 // ==============================================================================
 
@@ -94,7 +94,7 @@ const int SOLENOID_OFF  = HIGH; // Relay HIGH -> De-energizes Solenoid (Locks Do
 
 // ── Timing Configurations ────────────────────────────────────────────────────
 const unsigned long GRACE_PERIOD_MS    = 20UL * 60UL * 1000UL; // 20 mins = 1,200,000 ms
-const unsigned long BUZZER_DURATION_MS = 2UL * 60UL * 1000UL;  // Real scheduled alerts: 2 minutes
+const unsigned long BUZZER_DURATION_MS = 20UL * 60UL * 1000UL; // Real scheduled alerts: 20 minutes
 const unsigned long STARTUP_BEEP_MS    = 10UL * 1000UL;         // Boot indication only: 10 seconds
 
 // Initialize 16x2 I2C LCD (Auto-detected in setup to 0x27 or 0x3F)
@@ -126,11 +126,11 @@ const unsigned long DISPLAY_CYCLE_INTERVAL_MS = 2000; // Increment every 2 secon
 // ── Alert State Variables ────────────────────────────────────────────────────
 bool isAlertActive = false;
 unsigned long alertStartTime = 0;
-unsigned long buzzerStartTime = 0; // New due events restart their own 2-minute buzzing window.
+unsigned long buzzerStartTime = 0; // New due events restart their own 20-minute buzzing window.
 bool startupBeepActive = false;
 unsigned long startupBeepStartMs = 0;
 
-// Buzzer Cadence (1s BEEP / 1s PAUSE during the 2-minute buzzing window)
+// Buzzer Cadence (1s BEEP / 1s PAUSE during the 20-minute buzzing window)
 bool buzzerState = false;
 bool buzzerMutedByDrawer = false; // Keep it silent after an alerting drawer opens.
 unsigned long lastBuzzerToggle = 0;
@@ -195,7 +195,8 @@ struct ArduinoSchedule {
   int minute;
   String compartment;
   int drawer;
-  bool alertedToday;
+  unsigned long scheduledDay;     // Local epoch day; 0 = repeating daily.
+  unsigned long lastTriggeredDay; // Prevent another trigger on the same local day.
   bool active;
   String scheduleId; // Optional stable ID allows updates without replacing other times.
 };
@@ -228,8 +229,8 @@ String extractShortLabel(const String& str) {
 
   for (int i = 0; i < s.length(); i++) {
     char c = s.charAt(i);
-    if (c >= 'A' && c <= 'C') {
-      if (i + 1 < s.length() && s.charAt(i + 1) >= '1' && s.charAt(i + 1) <= '7') {
+    if (c >= 'A' && c <= 'G') {
+      if (i + 1 < s.length() && s.charAt(i + 1) >= '1' && s.charAt(i + 1) <= '3') {
         return s.substring(i, i + 2);
       }
     }
@@ -440,97 +441,88 @@ void lockDrawer(int drawerNum) {
   }
 }
 
-// ── Add Compartment to Active Alert List ──────────────────────────────────────
+// Tell the drawer controller which occurrence is due or cleared. The master
+// forwards the UART form for Uno R3; Uno R4 can also deliver directly via Wi-Fi.
+void notifyCompartmentLED(const String& compartment, int drawer, bool alerting) {
+  String label = extractShortLabel(compartment);
+  if (label.length() != 2 || label[0] < 'A' || label[0] > 'G' ||
+      label[1] < '1' || label[1] > '3') return;
+  int slot = (label[1] - '1') * 7 + (label[0] - 'A');
+  String action = alerting ? "alert" : "clear-alert";
+  Serial.println("LED:" + String(drawer) + ":" + String(slot) + ":" + action);
+#if HAS_WIFI
+  if (WiFi.status() != WL_CONNECTED) return;
+  WiFiClient cli;
+  IPAddress ip = drawer == 2 ? esp2IP : esp1IP;
+  String host = ip != INADDR_NONE ? ip.toString() :
+                String(drawer == 2 ? "dispenser-drawer2.local" : "dispenser-drawer1.local");
+  bool connected = ip != INADDR_NONE ? cli.connect(ip, 80) : cli.connect(host.c_str(), 80);
+  if (connected) {
+    cli.print("GET /" + action + "?slot=" + String(slot) + " HTTP/1.1\r\nHost: " +
+              host + "\r\nConnection: close\r\n\r\n");
+    delay(10);
+    cli.stop();
+  }
+#endif
+}
+
+void clearCurrentCompartmentLEDs() {
+  for (int i = 0; i < alertCount; i++) {
+    if (!activeAlerts[i].taken) {
+      notifyCompartmentLED(activeAlerts[i].shortLabel, activeAlerts[i].drawer, false);
+    }
+  }
+}
+
+// A new due time replaces the previous indication. Never treat a replaced
+// occurrence as picked up; only an actual pickup confirms the current dose.
 void startAlert(const String& rawComp, int drawerNum = 1) {
-  bool addedNew = false;
-  String remaining = rawComp;
-  remaining.trim();
+  String token = rawComp;
+  token.trim();
+  if (token.length() == 0) return;
+  String upperToken = token;
+  upperToken.toUpperCase();
+  if (upperToken.indexOf("DRAWER 2") != -1 || upperToken.indexOf("2:") == 0) drawerNum = 2;
+  else if (upperToken.indexOf("DRAWER 1") != -1 || upperToken.indexOf("1:") == 0) drawerNum = 1;
+  String shortLabel = extractShortLabel(token);
 
-  // Split multiple compartments if separated by commas or semicolons
-  while (remaining.length() > 0) {
-    int sepIdx = remaining.indexOf(',');
-    int semiIdx = remaining.indexOf(';');
-    if (sepIdx == -1 || (semiIdx >= 0 && semiIdx < sepIdx)) sepIdx = semiIdx;
-    String token = (sepIdx != -1) ? remaining.substring(0, sepIdx) : remaining;
-    if (sepIdx != -1) remaining = remaining.substring(sepIdx + 1);
-    else remaining = "";
-    token.trim();
-    if (token.length() == 0) continue;
+  // UART and HTTP can deliver the same alert. Do not restart its timer.
+  unsigned long occurrenceMinute = clientBaseEpoch > 0 ?
+    (clientBaseEpoch + (millis() - clientBaseMillis) / 1000UL) / 60UL : millis() / 60000UL;
+  static unsigned long lastOccurrenceMinute = ~0UL;
+  static String lastCompartment = "";
+  static int lastDrawer = 0;
+  if (lastOccurrenceMinute == occurrenceMinute && lastCompartment == shortLabel &&
+      lastDrawer == drawerNum) return;
+  lastOccurrenceMinute = occurrenceMinute;
+  lastCompartment = shortLabel;
+  lastDrawer = drawerNum;
 
-    int drw = drawerNum;
-    String upperToken = token;
-    upperToken.toUpperCase();
-    if (upperToken.indexOf("DRAWER 2") != -1 || upperToken.indexOf("2:") == 0 || upperToken.indexOf("(2") != -1) drw = 2;
-    else if (upperToken.indexOf("DRAWER 1") != -1 || upperToken.indexOf("1:") == 0 || upperToken.indexOf("(1") != -1) drw = 1;
+  clearCurrentCompartmentLEDs();
+  if (isAlertActive) lockDrawer(0);
+  alertCount = 1;
+  activeAlerts[0].shortLabel = shortLabel;
+  activeAlerts[0].fullName = token;
+  activeAlerts[0].drawer = drawerNum;
+  activeAlerts[0].taken = false;
 
-    String shortLabel = extractShortLabel(token);
+  startupBeepActive = false;
+  isAlertActive = true;
+  lastDoseTaken = false;
+  alertStartTime = millis();
+  buzzerStartTime = alertStartTime;
+  buzzerMutedByDrawer = drawerNum == 2 ? drawer2IsOpen : drawer1IsOpen;
+  buzzerState = !buzzerMutedByDrawer;
+  writeRelayQuietly(BUZZER_RELAY_PIN, buzzerState ? RELAY_ON : RELAY_OFF);
+  lastBuzzerToggle = alertStartTime;
+  currentDisplayIdx = 0;
+  lastDisplayCycleMs = millis() - DISPLAY_CYCLE_INTERVAL_MS;
+  lastCountdownUpdate = millis() - 1000UL;
 
-    // Prevent duplicate entries for active untaken alert
-    bool alreadyExists = false;
-    for (int i = 0; i < alertCount; i++) {
-      if (activeAlerts[i].shortLabel == shortLabel && activeAlerts[i].drawer == drw && !activeAlerts[i].taken) {
-        alreadyExists = true;
-        break;
-      }
-    }
-
-    if (!alreadyExists && alertCount >= MAX_ACTIVE_ALERTS) {
-      Serial.println("[ARDUINO] WARNING: Too many simultaneous alerts; new slot not queued.");
-    }
-    if (!alreadyExists && alertCount < MAX_ACTIVE_ALERTS) {
-      activeAlerts[alertCount].shortLabel = shortLabel;
-      activeAlerts[alertCount].fullName = token;
-      activeAlerts[alertCount].drawer = drw;
-      activeAlerts[alertCount].taken = false;
-      alertCount++;
-      addedNew = true;
-
-      // Unlock ONLY the corresponding drawer solenoid relay
-      unlockDrawer(drw);
-
-      Serial.print("[ARDUINO] 🚨 Alert Compartment Queued: ");
-      Serial.print(shortLabel);
-      Serial.print(" (Drawer ");
-      Serial.print(drw);
-      Serial.println(")");
-    }
-  }
-
-  // Start 20-minute countdown and 2-minute buzzer if not already alerting
-  if (!isAlertActive && alertCount > 0) {
-    startupBeepActive = false;  // Genuine scheduled dose takes priority over boot beep.
-    isAlertActive = true;
-    lastDoseTaken = false;
-    alertStartTime = millis();
-    buzzerStartTime = alertStartTime;
-
-    // Start Buzzer Relay (Will automatically stop after 2 minutes)
-    buzzerMutedByDrawer = false;
-    buzzerState = true;
-    writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_ON);
-    lastBuzzerToggle = millis();
-
-    currentDisplayIdx = 0;
-    lastDisplayCycleMs = millis() - DISPLAY_CYCLE_INTERVAL_MS;
-    lastCountdownUpdate = millis() - 1000UL;
-
-    // Trigger ESP32 Vibration over Serial UART & Wi-Fi
-    notifyESP32Vibrate(true);
-
-    Serial.println("[ARDUINO] 20-Minute Alert Window Activated. Buzzer active for 2 minutes.");
-  } else if (isAlertActive && addedNew) {
-    // Another schedule became due while an earlier dose is waiting. Preserve
-    // the original shared 20-minute grace timer, but restart ONLY the buzzer's
-    // 2-minute window so this newly due dose also rings for 2 minutes.
-    startupBeepActive = false;
-    buzzerStartTime = millis();
-    lastBuzzerToggle = buzzerStartTime;
-    buzzerMutedByDrawer = drawer1IsOpen || drawer2IsOpen;
-    buzzerState = !buzzerMutedByDrawer;
-    writeRelayQuietly(BUZZER_RELAY_PIN, buzzerState ? RELAY_ON : RELAY_OFF);
-    notifyESP32Vibrate(true);
-    Serial.println("[ARDUINO] Additional dose due: 2-minute scheduled buzzer window restarted.");
-  }
+  unlockDrawer(drawerNum);
+  notifyCompartmentLED(shortLabel, drawerNum, true);
+  notifyESP32Vibrate(true);
+  Serial.println("[ARDUINO] Current dose: " + token + "; buzzer and countdown: 20 minutes.");
 }
 
 // ── Resolve Doses in Drawer (Magnetic Reed Switch Triggered) ──────────────────
@@ -546,6 +538,7 @@ void resolveDoseTaken(int drawerNum) {
   // Mark all untaken doses in this opened drawer as TAKEN
   for (int i = 0; i < alertCount; i++) {
     if (!activeAlerts[i].taken && (activeAlerts[i].drawer == drawerNum || drawerNum == 0)) {
+      notifyCompartmentLED(activeAlerts[i].shortLabel, activeAlerts[i].drawer, false);
       activeAlerts[i].taken = true;
       if (takenSummary.length() > 0) takenSummary += ", ";
       takenSummary += activeAlerts[i].shortLabel;
@@ -610,6 +603,7 @@ void resolveDoseTaken(int drawerNum) {
 
 // ── Resolve Dose: MISSED (20-Minute Timeout Exceeded) ────────────────────────
 void resolveDoseMissed() {
+  clearCurrentCompartmentLEDs();
   isAlertActive = false;
 
   // Silence buzzer & lock both solenoid relays
@@ -793,7 +787,7 @@ void checkMagneticReedSwitches() {
       if (drawer1IsOpen) {
         Serial.println("[REED] Drawer 1 OPENED (Magnet Apart) -> Notifying ESP1 to turn ON LEDs!");
         notifyDrawerDoor(1, true);
-        if (isAlertActive) {
+        if (isAlertActive && activeAlerts[0].drawer == 1) {
           // Patient opened drawer during alert: silence buzzer for retrieval
           buzzerState = false;
           buzzerMutedByDrawer = true;
@@ -827,7 +821,7 @@ void checkMagneticReedSwitches() {
       if (drawer2IsOpen) {
         Serial.println("[REED] Drawer 2 OPENED (Magnet Apart) -> Notifying ESP2 to turn ON LEDs!");
         notifyDrawerDoor(2, true);
-        if (isAlertActive) {
+        if (isAlertActive && activeAlerts[0].drawer == 2) {
           buzzerState = false;
           buzzerMutedByDrawer = true;
           writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
@@ -894,6 +888,7 @@ void processSerialCommand(const String& cmd) {
     resolveDoseMissed();
   }
   else if (cmd == "STOP" || cmd == "SILENCE" || cmd == "CLEAR") {
+    clearCurrentCompartmentLEDs();
     isAlertActive = false;
     alertCount = 0;
     writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
@@ -938,26 +933,47 @@ void processSerialCommand(const String& cmd) {
 
 }
 
+// Convert an optional YYYY-MM-DD date to a local epoch day. 0 means daily.
+// Return false for malformed dates rather than accidentally repeating daily.
+bool parseScheduleDay(const String& date, unsigned long& day) {
+  day = 0;
+  if (date.length() == 0) return true;
+  if (date.length() != 10 || date[4] != '-' || date[7] != '-') return false;
+  for (int i = 0; i < 10; i++) {
+    if (i != 4 && i != 7 && (date[i] < '0' || date[i] > '9')) return false;
+  }
+  int year = date.substring(0, 4).toInt();
+  int month = date.substring(5, 7).toInt();
+  int dom = date.substring(8, 10).toInt();
+  if (year < 1971 || year > 2099 || month < 1 || month > 12) return false;
+  const int monthDays[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  bool leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+  if (dom < 1 || dom > monthDays[month - 1] + (month == 2 && leap ? 1 : 0)) return false;
+  for (int y = 1970; y < year; y++) {
+    day += (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) ? 366UL : 365UL;
+  }
+  for (int m = 1; m < month; m++) day += monthDays[m - 1] + (m == 2 && leap ? 1 : 0);
+  day += dom - 1;
+  return true;
+}
+
 // ── Check Scheduled Alarms on Arduino (Direct Wi-Fi / Uno R4) ────────────────
 void checkArduinoSchedules() {
   if (clientBaseEpoch == 0 || scheduleCount == 0) return;
-
   unsigned long curEpoch = clientBaseEpoch + ((millis() - clientBaseMillis) / 1000);
   unsigned long localEpoch = curEpoch + 28800UL; // GMT+8
-  int curHour = (localEpoch % 86400) / 3600;
-  int curMin  = (localEpoch % 3600) / 60;
+  unsigned long today = localEpoch / 86400UL;
+  int curHour = (localEpoch % 86400UL) / 3600UL;
+  int curMin = (localEpoch % 3600UL) / 60UL;
 
   for (int i = 0; i < scheduleCount; i++) {
-    if (schedules[i].active && schedules[i].hour == curHour && schedules[i].minute == curMin) {
-      if (!schedules[i].alertedToday) {
-        schedules[i].alertedToday = true;
-        Serial.print("[ARDUINO] 🚨 SCHEDULE DUE! Ringing for: ");
-        Serial.println(schedules[i].compartment);
-        startAlert(schedules[i].compartment, schedules[i].drawer);
-      }
-    } else if (schedules[i].minute != curMin) {
-      schedules[i].alertedToday = false;
-    }
+    ArduinoSchedule& schedule = schedules[i];
+    if (!schedule.active || schedule.lastTriggeredDay == today) continue;
+    if (schedule.scheduledDay != 0 && schedule.scheduledDay != today) continue;
+    if (schedule.hour != curHour || schedule.minute != curMin) continue;
+    schedule.lastTriggeredDay = today;
+    if (schedule.scheduledDay != 0) schedule.active = false; // One date, one occurrence.
+    startAlert(schedule.compartment, schedule.drawer);
   }
 }
 
@@ -1088,7 +1104,7 @@ void setup() {
   lastBuzzerToggle = startupBeepStartMs;
   buzzerState = true;
   writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_ON);
-  Serial.println("[ARDUINO] Startup beep: 10 seconds maximum; scheduled alerts still beep 2 minutes.");
+  Serial.println("[ARDUINO] Startup beep: 10 seconds maximum; scheduled alerts still beep 20 minutes.");
   Serial.println("[ARDUINO] Ready! Dual Solenoid Relays (Pin 8 & 9) + Reed Switches (Pin 2 & 3).");
 }
 
@@ -1107,7 +1123,7 @@ void loop() {
   checkMagneticReedSwitches();
 
   // 3. Startup notification (10 seconds max, 1s ON / 1s OFF).
-  // A real scheduled alert cancels this and uses its separate 2-minute timer.
+  // A real scheduled alert cancels this and uses its separate 20-minute timer.
   if (startupBeepActive && !isAlertActive && !buzzerPulseActive) {
     unsigned long now = millis();
     if (now - startupBeepStartMs >= STARTUP_BEEP_MS) {
@@ -1122,7 +1138,7 @@ void loop() {
     }
   }
 
-  // 4. Active 20-Minute Alert State Machine & 2-Minute Buzzer Cutoff
+  // 4. Active 20-Minute Alert State Machine & 20-Minute Buzzer Cutoff
   if (isAlertActive) {
     unsigned long elapsed = millis() - alertStartTime;
 
@@ -1132,7 +1148,7 @@ void loop() {
     } else {
       unsigned long now = millis();
 
-      // B. Buzzer Beeps ONLY for the first 2 minutes (120,000 ms)
+      // B. Buzzer Beeps ONLY for the first 20 minutes (1,200,000 ms)
       if (!buzzerMutedByDrawer && (now - buzzerStartTime) < BUZZER_DURATION_MS) {
         if (buzzerState && (now - lastBuzzerToggle >= BUZZER_BEEP_MS)) {
           buzzerState = false;
@@ -1144,11 +1160,11 @@ void loop() {
           lastBuzzerToggle = now;
         }
       } else {
-        // Scheduled 2-minute buzzer cutoff reached or drawer was opened.
+        // Scheduled 20-minute buzzer cutoff reached or drawer was opened.
         if (buzzerState) {
           buzzerState = false;
           writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
-          Serial.println("[ARDUINO] 2-Minute Buzzing Timeout: Buzzer silenced. Alert & countdown continuing on LCD.");
+          Serial.println("[ARDUINO] 20-Minute Buzzing Timeout: Buzzer silenced (drawer opened or alert window expired).");
         }
       }
 
@@ -1286,6 +1302,8 @@ void loop() {
       int h = getQueryParam(req, "hour").toInt();
       int m = getQueryParam(req, "minute").toInt();
       String amPm = getQueryParam(req, "amPm");
+      String date = urlDecode(getQueryParam(req, "date"));
+      unsigned long scheduledDay = 0;
       String rawComp = getQueryParam(req, "compartment");
       String comp = urlDecode(rawComp);
       comp.trim();
@@ -1305,6 +1323,17 @@ void loop() {
       if (amPm.equalsIgnoreCase("AM") && h == 12) h24 = 0;
       else if (amPm.equalsIgnoreCase("PM") && h != 12) h24 = h + 12;
 
+      if (h24 < 0 || h24 > 23 || m < 0 || m > 59 || !parseScheduleDay(date, scheduledDay)) {
+        client.println("HTTP/1.1 400 Bad Request");
+        client.println("Content-Type: application/json");
+        client.println("Access-Control-Allow-Origin: *");
+        client.println("Connection: close");
+        client.println();
+        client.println("{\"status\":\"error\",\"message\":\"Invalid time or date; use YYYY-MM-DD\"}");
+        client.stop();
+        return;
+      }
+
       if (epochStr.length() > 0) {
         clientBaseEpoch = (unsigned long)epochStr.toInt();
         clientBaseMillis = millis();
@@ -1315,7 +1344,9 @@ void loop() {
       unsigned long localEpoch = curEpoch + 28800UL; // GMT+8
       int curHour = (localEpoch % 86400) / 3600;
       int curMin  = (localEpoch % 3600) / 60;
-      bool isNow = (clientBaseEpoch > 0 && h24 == curHour && m == curMin);
+      unsigned long today = localEpoch / 86400UL;
+      bool isNow = (clientBaseEpoch > 0 && h24 == curHour && m == curMin &&
+                    (scheduledDay == 0 || scheduledDay == today));
 
       // Same compartment may have DIFFERENT schedule times. Previously, the
       // first matching compartment was always overwritten, losing schedule 1.
@@ -1332,25 +1363,33 @@ void loop() {
         }
         if (scheduleId.length() == 0 && schedules[i].drawer == drw &&
             schedules[i].compartment.equalsIgnoreCase(canonicalComp.c_str()) &&
-            schedules[i].hour == h24 && schedules[i].minute == m) {
+            schedules[i].hour == h24 && schedules[i].minute == m &&
+            schedules[i].scheduledDay == scheduledDay) {
           foundSchedule = i;
           break;
         }
       }
       bool saved = true;
+      bool isNew = foundSchedule < 0;
       if (foundSchedule < 0) {
         if (scheduleCount < MAX_ARDUINO_SCHEDULES) foundSchedule = scheduleCount++;
         else saved = false;
       }
       if (saved) {
         ArduinoSchedule& target = schedules[foundSchedule];
+        bool unchanged = !isNew && target.hour == h24 && target.minute == m &&
+                         target.scheduledDay == scheduledDay && target.drawer == drw &&
+                         target.compartment.equalsIgnoreCase(canonicalComp.c_str());
+        if (!unchanged) {
+          target.lastTriggeredDay = isNow ? today : 0;
+          target.active = true;
+        }
+        target.scheduledDay = scheduledDay;
         target.hour = h24;
         target.minute = m;
         target.compartment = canonicalComp;
         target.drawer = drw;
         target.scheduleId = scheduleId;
-        target.alertedToday = isNow; // Original: no immediate trigger when saved at due time.
-        target.active = true;
       }
 
       char dispTime[17];

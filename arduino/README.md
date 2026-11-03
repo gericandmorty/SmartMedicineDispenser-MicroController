@@ -2,6 +2,8 @@
 
 This Arduino code controls the physical user interface and feedback mechanisms of the Smart Medicine Dispenser, connecting with the **ESP32-Mini Master** (which provides Wi-Fi and connects to the Mobile App).
 
+See [current scheduling and light behavior](../README.md) for date handling, consecutive alarms, and verification.
+
 ---
 
 ## 🔌 Complete Hardware Pinout (Arduino Uno R3)
@@ -42,7 +44,7 @@ This Arduino code controls the physical user interface and feedback mechanisms o
 * **Drawer 1 Reed Switch:** One terminal to **`Pin 2`**, other terminal to **`GND`**.
 * **Drawer 2 Reed Switch:** One terminal to **`Pin 3`**, other terminal to **`GND`**.
 * Internal pull-up resistors are enabled in software (`INPUT_PULLUP`).
-* When drawer is pulled open, magnet separates from switch -> triggers dose **TAKEN**!
+* Opening the alerting drawer silences the buzzer. Closing it confirms dose **TAKEN** and clears its light.
 
 ### 5. Arduino to ESP32-Mini Serial Link
 ```
@@ -57,7 +59,7 @@ Arduino GND        <──── ESP32 GND (Shared Common Ground)
 
 1. **Schedule Trigger:**
    * ESP32-Mini matches schedule time -> sends `ALERT:Drawer 1 (A1)` over Serial to Arduino.
-   * Arduino turns on **Buzzer Relay** (beeps cadence).
+   * Arduino turns on **Buzzer Relay** (1 second on / 1 second off, up to 20 minutes).
    * Arduino energizes **Solenoid** to unlock the drawer.
    * LCD begins displaying **20-minute live countdown**:
      ```
@@ -65,20 +67,20 @@ Arduino GND        <──── ESP32 GND (Shared Common Ground)
      Line 2: 19m 58s left
      ```
 
-2. **User Takes Medicine (Reed Switch Opens):**
+2. **User Takes Medicine (Drawer Opens, Then Closes):**
    * Patient opens Drawer 1.
    * Magnetic reed switch on Pin 2 triggers.
-   * Arduino **instantly silences buzzer relay** and locks solenoid.
+   * Arduino **instantly silences the buzzer relay** when the alerting drawer opens. The current compartment stays indicated during retrieval; closing the drawer locks it and confirms pickup.
    * LCD displays:
      ```
      Line 1: DOSE TAKEN! :)
-     Line 2: Drawer 1 Opened
+     Line 2: A1 OK
      ```
-   * Arduino sends `TAKEN:Drawer 1` over Serial to ESP32-Mini.
+   * Arduino sends `TAKEN:Drawer 1 (A1)` over Serial to ESP32-Mini.
    * ESP32-Mini stops vibration, turns off alerting LED on ESP1/ESP2, and marks status **`TAKEN`** on the Mobile App!
 
 3. **20-Minute Timeout (User Misses Dose):**
-   * If 20 minutes elapse without drawer opening:
+   * If 20 minutes elapse without pickup confirmation:
    * Arduino shuts off buzzer relay and locks solenoid.
    * LCD displays:
      ```

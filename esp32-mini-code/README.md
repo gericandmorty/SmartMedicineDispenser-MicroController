@@ -42,6 +42,8 @@ This directory contains the firmware for the **Master ESP32 Mini Controller**, w
 
 ---
 
+See [current scheduling and light behavior](../README.md) for date handling and consecutive alarms.
+
 ## 🔌 ESP32 Mini Hardware Wiring
 
 | Function | Default ESP32 Pin | Connected Component | Description |
@@ -84,7 +86,7 @@ ESP32 GPIO 4 ───[ 1kΩ Resistor ]─── Base (NPN 2N2222)
 3. **Resolution A - Patient Takes Dose (On-Time):**
    * Patient taps "I Have Taken This" or opens drawer (`GET /stop-vibrate` or `POST /dispense-confirm`).
    * Vibration stops instantly.
-   * Compartment LED returns to steady Green.
+   * Compartment LED turns off and stays off until its next due occurrence.
    * Arduino LCD displays `"DOSE TAKEN! :)"`.
    * Logged as **`TAKEN`** with exact elapsed seconds in `GET /events`.
 

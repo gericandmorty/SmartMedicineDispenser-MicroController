@@ -83,6 +83,7 @@ struct ReminderSchedule {
   char compartment[24]; // e.g. "Drawer 1 (A1)"
   int slotIndex;        // 0 - 41
   bool active;
+  unsigned long lastTriggeredDate; // YYYYMMDD, persisted to prevent replay after reboot.
 };
 
 ReminderSchedule schedules[MAX_SCHEDULES];
@@ -134,7 +135,7 @@ int activeDispensePin = -1;
 // Guard against duplicate triggers within the same minute
 int lastTriggeredMinute = -1;
 int lastTriggeredHour = -1;
-int lastTriggeredDay = -1;
+int lastTriggeredDay = -1; // YYYYMMDD, not just the day of month.
 
 // ── Helper: Format Current Time ──────────────────────────────────────────────
 String getCurrentTimeString() {
@@ -409,6 +410,7 @@ void saveSchedulesToNVS() {
     preferences.putString((pfx + "c").c_str(), schedules[i].compartment);
     preferences.putInt((pfx + "s").c_str(), schedules[i].slotIndex);
     preferences.putBool((pfx + "a").c_str(), schedules[i].active);
+    preferences.putULong((pfx + "fired").c_str(), schedules[i].lastTriggeredDate);
   }
   preferences.end();
   Serial.printf("[NVS] Saved %d schedules to flash memory.\n", scheduleCount);
@@ -431,6 +433,7 @@ void loadSchedulesFromNVS() {
     strncpy(schedules[i].compartment, c.c_str(), sizeof(schedules[i].compartment));
     schedules[i].slotIndex = preferences.getInt((pfx + "s").c_str(), 0);
     schedules[i].active = preferences.getBool((pfx + "a").c_str(), true);
+    schedules[i].lastTriggeredDate = preferences.getULong((pfx + "fired").c_str(), 0);
   }
   preferences.end();
   Serial.printf("[NVS] Loaded %d schedules from flash.\n", scheduleCount);
@@ -445,6 +448,9 @@ int findScheduleIndex(const char* id) {
 
 bool addOrUpdateSchedule(const char* id, int h, int m, const char* d, const char* c, int slot) {
   int idx = findScheduleIndex(id);
+  bool unchanged = idx >= 0 && schedules[idx].hour == h && schedules[idx].minute == m &&
+                   strcmp(schedules[idx].date, d) == 0 &&
+                   strcmp(schedules[idx].compartment, c) == 0 && schedules[idx].slotIndex == slot;
   if (idx == -1) {
     if (scheduleCount >= MAX_SCHEDULES) return false;
     idx = scheduleCount++;
@@ -456,7 +462,10 @@ bool addOrUpdateSchedule(const char* id, int h, int m, const char* d, const char
   strncpy(schedules[idx].date, d, sizeof(schedules[idx].date));
   strncpy(schedules[idx].compartment, c, sizeof(schedules[idx].compartment));
   schedules[idx].slotIndex = slot;
-  schedules[idx].active = true;
+  if (!unchanged) {
+    schedules[idx].active = true;
+    schedules[idx].lastTriggeredDate = 0;
+  }
 
   saveSchedulesToNVS();
   return true;
@@ -508,9 +517,9 @@ void checkAlarms() {
       stopVibration();
       currentAlert.isAlerting = false;
     }
-    return;
   }
 
+  // Continue checking while alerting: a later due time replaces the old light.
   // Check if any schedule matches the current minute
   struct tm timeinfo;
   bool gotTime = getLocalTime(&timeinfo, 50);
@@ -527,7 +536,8 @@ void checkAlarms() {
 
   int currentHour = timeinfo.tm_hour;
   int currentMinute = timeinfo.tm_min;
-  int currentDay = timeinfo.tm_mday;
+  int currentDay = (timeinfo.tm_year + 1900) * 10000 +
+                   (timeinfo.tm_mon + 1) * 100 + timeinfo.tm_mday;
   int currentMonth = timeinfo.tm_mon + 1;
   int currentYear = timeinfo.tm_year + 1900;
 
@@ -538,10 +548,10 @@ void checkAlarms() {
   }
 
   char todayDateStr[16];
-  snprintf(todayDateStr, sizeof(todayDateStr), "%04d-%02d-%02d", currentYear, currentMonth, currentDay);
+  snprintf(todayDateStr, sizeof(todayDateStr), "%04d-%02d-%02d", currentYear, currentMonth, timeinfo.tm_mday);
 
   for (int i = 0; i < scheduleCount; i++) {
-    if (!schedules[i].active) continue;
+    if (!schedules[i].active || schedules[i].lastTriggeredDate == (unsigned long)currentDay) continue;
 
     if (schedules[i].hour == currentHour && schedules[i].minute == currentMinute) {
       bool dateMatches = (strlen(schedules[i].date) == 0) || (strcmp(schedules[i].date, todayDateStr) == 0);
@@ -556,8 +566,19 @@ void checkAlarms() {
 
         int drawer = (schedules[i].slotIndex >= 21) ? 2 : 1;
 
-        // 1. Enter 20-minute Active Alert State (if not already alerting)
-        if (!currentAlert.isAlerting) {
+        // Clear the previous indication, including when it was in the other
+        // drawer. Replacement is not a pickup confirmation.
+        if (currentAlert.isAlerting) {
+          int previousDrawer = currentAlert.slotIndex >= 21 ? 2 : 1;
+          notifyDrawerLED(previousDrawer, currentAlert.slotIndex, "clear-alert");
+        }
+        // Persist before notifying hardware so a reboot cannot replay this dose.
+        schedules[i].lastTriggeredDate = currentDay;
+        if (strlen(schedules[i].date) > 0) schedules[i].active = false;
+        saveSchedulesToNVS();
+
+        // 1. Start a fresh 20-minute window for the newly due occurrence.
+        {
           currentAlert.isAlerting = true;
           strncpy(currentAlert.scheduleId, schedules[i].id, sizeof(currentAlert.scheduleId));
           strncpy(currentAlert.compartment, schedules[i].compartment, sizeof(currentAlert.compartment));
@@ -580,11 +601,6 @@ void checkAlarms() {
         // Reset timer so blocking HTTP calls to ESP1/ESP2 & Arduino do NOT consume vibration duration!
         vibrationStateTimer = millis();
 
-        // One-time schedule is marked inactive after firing
-        if (strlen(schedules[i].date) > 0) {
-          schedules[i].active = false;
-          saveSchedulesToNVS();
-        }
       }
     }
   }
@@ -709,6 +725,17 @@ void handleVibrate() {
   server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"vibrating\",\"pulses\":" + String(pulses) + ",\"duration\":" + String(duration) + "}");
 }
 
+int compartmentSlot(const String& compartment, int drawer) {
+  String label = compartment;
+  label.toUpperCase();
+  for (unsigned int i = 0; i + 1 < label.length(); i++) {
+    if (label[i] >= 'A' && label[i] <= 'G' && label[i + 1] >= '1' && label[i + 1] <= '3') {
+      return (drawer == 2 ? 21 : 0) + (label[i + 1] - '1') * 7 + label[i] - 'A';
+    }
+  }
+  return -1;
+}
+
 // GET/POST /alert (Triggered by mobile watchdog or Arduino over Wi-Fi)
 void handleAlert() {
   sendCORSHeaders();
@@ -717,10 +744,21 @@ void handleAlert() {
   if (server.hasArg("drawer")) drw = server.arg("drawer").toInt();
   else if (comp.indexOf("Drawer 2") != -1 || comp.indexOf("2:") == 0) drw = 2;
 
-  int slot = (drw == 2) ? 21 : 0;
+  int slot = compartmentSlot(comp, drw);
   if (server.hasArg("slotIndex")) slot = server.arg("slotIndex").toInt();
+  if (drw == 2 && slot >= 0 && slot < 21) slot += 21;
+  if (slot < 0 || slot >= 42) {
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid compartment or slotIndex\"}");
+    return;
+  }
+  drw = slot >= 21 ? 2 : 1;
 
-  if (!currentAlert.isAlerting) {
+  bool duplicate = currentAlert.isAlerting && currentAlert.slotIndex == slot &&
+                   comp == String(currentAlert.compartment);
+  if (!duplicate) {
+    if (currentAlert.isAlerting) {
+      notifyDrawerLED(currentAlert.slotIndex >= 21 ? 2 : 1, currentAlert.slotIndex, "clear-alert");
+    }
     currentAlert.isAlerting = true;
     strncpy(currentAlert.scheduleId, "remote_alert", sizeof(currentAlert.scheduleId));
     strncpy(currentAlert.compartment, comp.c_str(), sizeof(currentAlert.compartment));
@@ -730,6 +768,7 @@ void handleAlert() {
     currentAlert.lastReminderVibrateMs = millis();
   }
 
+  if (!duplicate) notifyDrawerLED(drw, slot, "alert");
   // Start continuous 1-minute vibration alert
   startVibrationAlert(1, 60000UL, 0);
   Serial.printf("[ALERT] Hardware alert received for %s (Drawer %d) -> Vibration active (60s)\n", comp.c_str(), drw);
@@ -815,11 +854,10 @@ void handleSetSchedule() {
 
   bool success = addOrUpdateSchedule(id.c_str(), hour, minute, date.c_str(), compartment.c_str(), slotIndex);
 
-  // Notify drawer LED to turn Green (Active Schedule)
-  int drawer = (slotIndex >= 21) ? 2 : 1;
-  notifyDrawerLED(drawer, slotIndex, "led?state=active&color=green");
-
   if (success) {
+    // Save schedule metadata; the drawer stays dark until /alert arrives.
+    int drawer = (slotIndex >= 21) ? 2 : 1;
+    notifyDrawerLED(drawer, slotIndex, "led?state=active");
     String resp = "{\"status\":\"ok\",\"message\":\"Schedule saved\",\"id\":\"" + id + "\",\"rtc_calibrated\":" + String(rtcCalibrated ? "true" : "false") + "}";
     server.send(200, "application/json", resp);
   } else {
@@ -1021,7 +1059,21 @@ void handleSerialFromArduino() {
     if (msg.startsWith("TAKEN:")) {
       String comp = msg.substring(6);
       Serial.printf("[SERIAL <- ARDUINO] Magnetic Reed Switch Triggered! Dose TAKEN for: %s\n", comp.c_str());
-      handleStopVibrate(); // Marks dose TAKEN, stops vibration, clears LED, logs event!
+      // A delayed pickup for an older compartment must not clear the new dose.
+      if (currentAlert.isAlerting && comp == String(currentAlert.compartment)) handleStopVibrate();
+    } else if (msg.startsWith("LED:")) {
+      // Forward direct Arduino schedule/clear events to the correct drawer.
+      int secondColon = msg.indexOf(':', 4);
+      int thirdColon = msg.indexOf(':', secondColon + 1);
+      if (secondColon > 4 && thirdColon > secondColon) {
+        int drawer = msg.substring(4, secondColon).toInt();
+        int slot = msg.substring(secondColon + 1, thirdColon).toInt();
+        String action = msg.substring(thirdColon + 1);
+        if ((drawer == 1 || drawer == 2) && slot >= 0 && slot < 21 &&
+            (action == "alert" || action == "clear-alert")) {
+          notifyDrawerLED(drawer, slot, action);
+        }
+      }
     } else if (msg.startsWith("DRAWER:1:OPEN")) {
       Serial.println("[SERIAL <- ARDUINO] Drawer 1 OPENED -> Telling ESP1 to enable LEDs!");
       notifyDrawerDoorState(1, true);
