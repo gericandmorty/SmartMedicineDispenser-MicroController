@@ -18,16 +18,13 @@ Drawer 2 consists of a 7-column by 3-row grid (**21 total compartments**):
 
 ---
 
-## 🎨 LED Color States
+## Scheduled light behavior
 
-1. **Active / In Stock (`GREEN`)**:
-   - Compartment has an active scheduled reminder and pill stock is available (1–7 doses).
-2. **Out of Stock (`RED`)**:
-   - 0/7 doses remaining (weekly 7-day cycle completed). Flags that restocking is required.
-3. **Due Now / Alerting (`PULSING AMBER / ORANGE`)**:
-   - The scheduled alarm time has arrived; pulses during the 20-minute countdown window to guide the patient directly to the correct compartment.
-4. **Inactive (`OFF`)**:
-   - Empty compartment with no active schedule.
+The sketch uses discrete compartment LEDs. Saved schedules stay dark. Only the
+currently due compartment blinks while its drawer is open; a new due compartment
+replaces the previous indication. Pickup confirmation or the 20-minute timeout
+clears the light. Closing and reopening the drawer does not restore a collected
+dose. See [scheduling details and verification](../README.md).
 
 ---
 
@@ -57,7 +54,7 @@ All endpoints support CORS for direct browser and mobile app calls:
 | Endpoint | Method | Query Parameters | Description |
 | :--- | :--- | :--- | :--- |
 | `/status` | `GET` | - | Returns JSON status of all 21 LEDs |
-| `/led` | `GET` | `slot=0&state=active` or `comp=A1&color=green` | Set state: `active` (green), `out_of_stock` (red), `alert` (blinking), `off` |
+| `/led` | `GET` | `slot=0&state=active` or `comp=A1&color=green` | Set state: `active` (saved, dark), `alert` (current due compartment), `off` |
 | `/alert` | `GET` | `slot=0` or `comp=A1` | Starts flashing amber alert on that compartment |
 | `/clear-alert`| `GET` | `slot=0` or `comp=A1` | Clears flashing alert (returns to green) |
 | `/clear` | `GET` | - | Turns off all 21 LEDs |
@@ -65,7 +62,7 @@ All endpoints support CORS for direct browser and mobile app calls:
 
 ### Example Wi-Fi Calls:
 ```bash
-# Turn slot 0 (A1) Green (In-stock schedule)
+# Save slot 0 (A1) schedule state; LED stays dark until due
 curl "http://dispenser-drawer2.local/led?slot=0&state=active"
 
 # Turn slot 0 (A1) Red (Out of stock)

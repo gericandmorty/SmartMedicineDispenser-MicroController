@@ -28,7 +28,7 @@ unsigned long lastDiscoveryBeacon = 0;
 //  Features:
 //    1. 1-to-1 exact cell mapping: scheduling A1 only lits A1; scheduling C3 only lits C3!
 //    2. Accepts both local slot numbers (0..20) and global mobile indices (21..41).
-//    3. When scheduled: that compartment LED stays SOLID ON.
+//    3. When scheduled: keep the compartment dark until its alarm is due.
 //    4. When schedule is up: that compartment LED BLINKS rapidly (350ms interval).
 //    5. ESP32-Mini simultaneously vibrates on GPIO 4 during the alert.
 //    6. Non-blocking engine using millis() - Wi-Fi stays fast & responsive.
@@ -57,12 +57,14 @@ const char* slotLabels[21] = {
 };
 
 // ── 21 Individual Slot States (Local 0..20) ──────────────────────────────────
-bool slotScheduled[21] = {false}; // true = Solid ON (Active Schedule)
+bool slotScheduled[21] = {false}; // Saved schedule metadata; never lights an LED.
 bool slotAlerting[21]  = {false}; // true = Blinking (Alarm is due now)
 bool isDrawerOpen      = false;   // Default: CLOSED. LEDs will NOT lit if reed is closed, ONLY if open!
 
 // Non-blocking blink timing
 unsigned long lastBlinkMs = 0;
+unsigned long alertStartedMs = 0;
+const unsigned long ALERT_DURATION_MS = 20UL * 60UL * 1000UL;
 bool blinkState = false;
 const unsigned long BLINK_INTERVAL = 350; // ms
 
@@ -180,16 +182,27 @@ void setScheduleSlot(int slot, bool active = true) {
   slotScheduled[slot] = active;
   if (!active) {
     slotAlerting[slot] = false;
+    setSlotLED(slot, false);
   }
   int r = slot / 7;
   int c = slot % 7;
   Serial.printf("[ESP2] Drawer 2 Compartment %s (Slot %d / Global %d, GPIO %d) Schedule: %s\n",
-                slotLabels[slot], slot, slot + 21, ledPins[r][c], active ? "LIT (SOLID ON)" : "OFF");
+                slotLabels[slot], slot, slot + 21, ledPins[r][c], active ? "SAVED (LED OFF UNTIL DUE)" : "OFF");
 }
 
 void setAlertSlot(int slot, bool alerting = true) {
   if (slot < 0 || slot >= 21) return;
+  if (alerting && !slotAlerting[slot]) {
+    // Only the newly due compartment may light. Repeated delivery must not
+    // restart the 20-minute timer or the blink cadence.
+    for (int i = 0; i < 21; i++) slotAlerting[i] = false;
+    allOff();
+    alertStartedMs = millis();
+    lastBlinkMs = alertStartedMs;
+    blinkState = true;
+  }
   slotAlerting[slot] = alerting;
+  if (!alerting) setSlotLED(slot, false);
   if (alerting) {
     slotScheduled[slot] = true; // Ensure it stays active
     int r = slot / 7;
@@ -213,7 +226,10 @@ void clearAll() {
 // ── Non-Blocking LED Engine ──────────────────────────────────────────────────
 void updateLEDState() {
   // If drawer reed switch is closed, LEDs will NOT lit up!
-  // Only if drawer reed switch is open will scheduled/alerting LEDs lit up!
+  // Only the currently due compartment is visible while the drawer is open.
+  if (millis() - alertStartedMs >= ALERT_DURATION_MS) {
+    for (int i = 0; i < 21; i++) slotAlerting[i] = false;
+  }
   if (!isDrawerOpen) {
     allOff();
     return;
@@ -233,9 +249,6 @@ void updateLEDState() {
     if (slotAlerting[slot]) {
       // Blinking alert when alarm is due
       shouldBeOn = blinkState;
-    } else if (slotScheduled[slot]) {
-      // Solid ON when scheduled in mobile app
-      shouldBeOn = true;
     }
 
     digitalWrite(ledPins[r][c], shouldBeOn ? HIGH : LOW);
@@ -253,9 +266,14 @@ void handleDoorState() {
 
   if (state.equalsIgnoreCase("open") || state == "1") {
     isDrawerOpen = true;
-    Serial.println("[ESP2] 🚪 Drawer 2 is OPEN -> LEDs enabled (will lit up for scheduled/alerting slots)!");
+    Serial.println("[ESP2] 🚪 Drawer 2 is OPEN -> LEDs enabled (only the currently due slot can light)!");
     server.send(200, "application/json", "{\"status\":\"ok\",\"drawer\":2,\"door\":\"open\",\"leds\":\"enabled\"}");
   } else {
+    // Opening then closing the drawer confirms pickup. Keep daily schedule
+    // metadata, but never restore this occurrence when the drawer reopens.
+    if (isDrawerOpen) {
+      for (int i = 0; i < 21; i++) slotAlerting[i] = false;
+    }
     isDrawerOpen = false;
     allOff();
     Serial.println("[ESP2] 🚪 Drawer 2 is CLOSED -> All LEDs OFF (will not lit)!");
@@ -302,7 +320,7 @@ void handleSchedule() {
 
   if (slot >= 0 && slot < 21) {
     setScheduleSlot(slot, true);
-    String resp = "{\"status\":\"ok\",\"drawer\":2,\"slot\":" + String(slot) + ",\"globalSlot\":" + String(slot + 21) + ",\"compartment\":\"" + String(slotLabels[slot]) + "\",\"gpio\":" + String(ledPins[slot/7][slot%7]) + ",\"state\":\"SOLID_ON\"}";
+    String resp = "{\"status\":\"ok\",\"drawer\":2,\"slot\":" + String(slot) + ",\"globalSlot\":" + String(slot + 21) + ",\"compartment\":\"" + String(slotLabels[slot]) + "\",\"gpio\":" + String(ledPins[slot/7][slot%7]) + ",\"state\":\"SCHEDULED\"}";
     server.send(200, "application/json", resp);
   } else {
     server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Provide valid slot (0..20 or 21..41) or comp (A1..G3)\"}");
@@ -347,6 +365,7 @@ void handleClearAlert() {
   } else {
     // Clear all alerts in Drawer 2
     for (int i = 0; i < 21; i++) slotAlerting[i] = false;
+    allOff();
     Serial.println("[ESP2] Cleared all active alerts in Drawer 2.");
   }
   server.send(200, "application/json", "{\"status\":\"ok\",\"drawer\":2,\"action\":\"alert_cleared\"}");
@@ -451,7 +470,7 @@ void handleRoot() {
       int slot = r * 7 + c;
       String cls = "cell";
       if (slotAlerting[slot]) cls += " cell-alert";
-      else if (slotScheduled[slot]) cls += " cell-on";
+      // Saved schedules remain dark until due.
       html += "<a href='/led?slot=" + String(slot) + "&state=" + (slotScheduled[slot] ? "off" : "active") + "' class='" + cls + "'>";
       html += String(slotLabels[slot]) + "<br><small style='font-size:9px;opacity:0.8;'>G" + String(ledPins[r][c]) + "</small>";
       html += "</a>";
@@ -504,6 +523,9 @@ void handleSerialCommands() {
       }
     } else if (cmd.startsWith("ALERT:")) {
       String arg = cmd.substring(6);
+      String upperArg = arg;
+      upperArg.toUpperCase();
+      if (upperArg.indexOf("DRAWER 1") != -1 || upperArg.startsWith("1:")) return;
       int slot = parseSlotIndex(arg);
       if (slot >= 0) setAlertSlot(slot, true);
     } else if (cmd.startsWith("SCHEDULE:")) {
@@ -512,6 +534,7 @@ void handleSerialCommands() {
       if (slot >= 0) setScheduleSlot(slot, true);
     } else if (cmd.equalsIgnoreCase("STOP") || cmd.equalsIgnoreCase("CLEAR-ALERT")) {
       for (int i = 0; i < 21; i++) slotAlerting[i] = false;
+      allOff();
       Serial.println("[ESP2] Cleared alerts in Drawer 2.");
     } else if (cmd.equalsIgnoreCase("CLEAR")) {
       clearAll();
