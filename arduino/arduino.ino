@@ -492,26 +492,68 @@ void startAlert(const String& rawComp, int drawerNum = 1) {
   static unsigned long lastOccurrenceMinute = ~0UL;
   static String lastCompartment = "";
   static int lastDrawer = 0;
-  if (lastOccurrenceMinute == occurrenceMinute && lastCompartment == shortLabel &&
+  if (lastOccurrenceMinute == occurrenceMinute && lastCompartment == token &&
       lastDrawer == drawerNum) return;
   lastOccurrenceMinute = occurrenceMinute;
-  lastCompartment = shortLabel;
+  lastCompartment = token;
   lastDrawer = drawerNum;
+
+  // Extract all compartment labels present in token (supports single and bulk e.g. "A1, A2, A3")
+  String labels[MAX_ACTIVE_ALERTS];
+  int drawers[MAX_ACTIVE_ALERTS];
+  int count = 0;
+  int currentDrawer = drawerNum;
+
+  for (int i = 0; i + 1 < (int)upperToken.length() && count < MAX_ACTIVE_ALERTS; i++) {
+    if (upperToken.substring(i).startsWith("DRAWER 2") || upperToken.substring(i).startsWith("2:")) {
+      currentDrawer = 2;
+    } else if (upperToken.substring(i).startsWith("DRAWER 1") || upperToken.substring(i).startsWith("1:")) {
+      currentDrawer = 1;
+    }
+
+    if (upperToken.charAt(i) >= 'A' && upperToken.charAt(i) <= 'G' &&
+        upperToken.charAt(i + 1) >= '1' && upperToken.charAt(i + 1) <= '3') {
+      String lbl = upperToken.substring(i, i + 2);
+      bool dup = false;
+      for (int k = 0; k < count; k++) {
+        if (labels[k] == lbl && drawers[k] == currentDrawer) { dup = true; break; }
+      }
+      if (!dup) {
+        labels[count] = lbl;
+        drawers[count] = currentDrawer;
+        count++;
+      }
+      i++;
+    }
+  }
+
+  if (count == 0) {
+    labels[0] = shortLabel;
+    drawers[0] = drawerNum;
+    count = 1;
+  }
 
   clearCurrentCompartmentLEDs();
   if (isAlertActive) lockDrawer(0);
-  alertCount = 1;
-  activeAlerts[0].shortLabel = shortLabel;
-  activeAlerts[0].fullName = token;
-  activeAlerts[0].drawer = drawerNum;
-  activeAlerts[0].taken = false;
+  alertCount = count;
+  for (int i = 0; i < count; i++) {
+    activeAlerts[i].shortLabel = labels[i];
+    activeAlerts[i].fullName = (count == 1) ? token : ("Drawer " + String(drawers[i]) + " (" + labels[i] + ")");
+    activeAlerts[i].drawer = drawers[i];
+    activeAlerts[i].taken = false;
+  }
 
   startupBeepActive = false;
   isAlertActive = true;
   lastDoseTaken = false;
   alertStartTime = millis();
   buzzerStartTime = alertStartTime;
-  buzzerMutedByDrawer = drawerNum == 2 ? drawer2IsOpen : drawer1IsOpen;
+  buzzerMutedByDrawer = false;
+  for (int i = 0; i < count; i++) {
+    if ((drawers[i] == 2 && drawer2IsOpen) || (drawers[i] == 1 && drawer1IsOpen)) {
+      buzzerMutedByDrawer = true;
+    }
+  }
   buzzerState = !buzzerMutedByDrawer;
   writeRelayQuietly(BUZZER_RELAY_PIN, buzzerState ? RELAY_ON : RELAY_OFF);
   lastBuzzerToggle = alertStartTime;
@@ -519,8 +561,10 @@ void startAlert(const String& rawComp, int drawerNum = 1) {
   lastDisplayCycleMs = millis() - DISPLAY_CYCLE_INTERVAL_MS;
   lastCountdownUpdate = millis() - 1000UL;
 
-  unlockDrawer(drawerNum);
-  notifyCompartmentLED(shortLabel, drawerNum, true);
+  for (int i = 0; i < count; i++) {
+    unlockDrawer(drawers[i]);
+    notifyCompartmentLED(labels[i], drawers[i], true);
+  }
   notifyESP32Vibrate(true);
   Serial.println("[ARDUINO] Current dose: " + token + "; buzzer and countdown: 20 minutes.");
 }
@@ -966,6 +1010,7 @@ void checkArduinoSchedules() {
   int curHour = (localEpoch % 86400UL) / 3600UL;
   int curMin = (localEpoch % 3600UL) / 60UL;
 
+  String dueCompartments = "";
   for (int i = 0; i < scheduleCount; i++) {
     ArduinoSchedule& schedule = schedules[i];
     if (!schedule.active || schedule.lastTriggeredDay == today) continue;
@@ -973,8 +1018,10 @@ void checkArduinoSchedules() {
     if (schedule.hour != curHour || schedule.minute != curMin) continue;
     schedule.lastTriggeredDay = today;
     if (schedule.scheduledDay != 0) schedule.active = false; // One date, one occurrence.
-    startAlert(schedule.compartment, schedule.drawer);
+    if (dueCompartments.length()) dueCompartments += "; ";
+    dueCompartments += schedule.compartment;
   }
+  if (dueCompartments.length()) startAlert(dueCompartments, 1);
 }
 
 // ── Helper: Extract HTTP Query Parameter ─────────────────────────────────────
@@ -1403,6 +1450,104 @@ void loop() {
       client.println("Access-Control-Allow-Origin: *");
       client.println();
       client.println(saved ? ("{\"status\":\"ok\",\"drawer\":" + String(drw) + "}") : "{\"status\":\"error\",\"message\":\"schedule capacity reached\"}");
+      delay(10);
+      client.stop();
+    }
+    else if (req.indexOf("/set-bulk-schedule") != -1 || req.indexOf("/bulk-schedule") != -1) {
+      int h = getQueryParam(req, "hour").toInt();
+      int m = getQueryParam(req, "minute").toInt();
+      String amPm = getQueryParam(req, "amPm");
+      String date = urlDecode(getQueryParam(req, "date"));
+      unsigned long scheduledDay = 0;
+      String rawComp = getQueryParam(req, "compartments");
+      if (rawComp.length() == 0) rawComp = getQueryParam(req, "compartment");
+      String comp = urlDecode(rawComp);
+      comp.trim();
+      String epochStr = getQueryParam(req, "client_epoch");
+      int drwParam = getQueryParam(req, "drawer").toInt();
+
+      String upperComp = comp;
+      upperComp.toUpperCase();
+      int drw = 1;
+      if (drwParam == 2 || upperComp.indexOf("DRAWER 2") != -1 || upperComp.indexOf("2:") == 0 || upperComp.indexOf("(2") != -1) {
+        drw = 2;
+      }
+
+      int h24 = h;
+      if (amPm.equalsIgnoreCase("AM") && h == 12) h24 = 0;
+      else if (amPm.equalsIgnoreCase("PM") && h != 12) h24 = h + 12;
+
+      if (h24 < 0 || h24 > 23 || m < 0 || m > 59 || !parseScheduleDay(date, scheduledDay)) {
+        client.println("HTTP/1.1 400 Bad Request");
+        client.println("Content-Type: application/json");
+        client.println("Access-Control-Allow-Origin: *");
+        client.println("Connection: close");
+        client.println();
+        client.println("{\"status\":\"error\",\"message\":\"Invalid time or date; use YYYY-MM-DD\"}");
+        client.stop();
+        return;
+      }
+
+      if (epochStr.length() > 0) {
+        clientBaseEpoch = (unsigned long)epochStr.toInt();
+        clientBaseMillis = millis();
+      }
+
+      String scheduleId = urlDecode(getQueryParam(req, "id"));
+      if (scheduleId.length() == 0) scheduleId = urlDecode(getQueryParam(req, "scheduleId"));
+      String canonicalComp = comp.length() > 0 ? comp : (drw == 2 ? "Drawer 2 (A1, A2, A3)" : "Drawer 1 (A1, A2, A3)");
+      if (canonicalComp.indexOf("Drawer") == -1) {
+        canonicalComp = "Drawer " + String(drw) + " (" + canonicalComp + ")";
+      }
+
+      int foundSchedule = -1;
+      for (int i = 0; i < scheduleCount; i++) {
+        if (scheduleId.length() > 0 && schedules[i].scheduleId == scheduleId) {
+          foundSchedule = i;
+          break;
+        }
+        if (scheduleId.length() == 0 && schedules[i].drawer == drw &&
+            schedules[i].compartment.equalsIgnoreCase(canonicalComp.c_str()) &&
+            schedules[i].hour == h24 && schedules[i].minute == m &&
+            schedules[i].scheduledDay == scheduledDay) {
+          foundSchedule = i;
+          break;
+        }
+      }
+      bool saved = true;
+      bool isNew = foundSchedule < 0;
+      if (foundSchedule < 0) {
+        if (scheduleCount < MAX_ARDUINO_SCHEDULES) foundSchedule = scheduleCount++;
+        else saved = false;
+      }
+      if (saved) {
+        ArduinoSchedule& target = schedules[foundSchedule];
+        bool unchanged = !isNew && target.hour == h24 && target.minute == m &&
+                         target.scheduledDay == scheduledDay && target.drawer == drw &&
+                         target.compartment.equalsIgnoreCase(canonicalComp.c_str());
+        if (!unchanged) {
+          target.lastTriggeredDay = 0;
+          target.active = true;
+        }
+        target.scheduledDay = scheduledDay;
+        target.hour = h24;
+        target.minute = m;
+        target.compartment = canonicalComp;
+        target.drawer = drw;
+        target.scheduleId = scheduleId;
+      }
+
+      char dispTime[17];
+      snprintf(dispTime, sizeof(dispTime), "%02d:%02d %s", h, m, amPm.c_str());
+      updateDisplay(saved ? "Bulk Saved!" : "Schedule FULL!", String(dispTime));
+      scheduleIdleScreen(3000);
+
+      client.println(saved ? "HTTP/1.1 200 OK" : "HTTP/1.1 507 Insufficient Storage");
+      client.println("Content-Type: application/json");
+      client.println("Connection: close");
+      client.println("Access-Control-Allow-Origin: *");
+      client.println();
+      client.println(saved ? ("{\"status\":\"ok\",\"action\":\"bulk_schedule_saved\",\"drawer\":" + String(drw) + ",\"compartments\":\"" + canonicalComp + "\"}") : "{\"status\":\"error\",\"message\":\"schedule capacity reached\"}");
       delay(10);
       client.stop();
     }

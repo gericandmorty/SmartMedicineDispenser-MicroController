@@ -192,9 +192,11 @@ void setScheduleSlot(int slot, bool active = true) {
 
 void setAlertSlot(int slot, bool alerting = true) {
   if (slot < 0 || slot >= 21) return;
-  if (alerting && !slotAlerting[slot]) {
-    // Only the newly due compartment may light. Repeated delivery must not
-    // restart the 20-minute timer or the blink cadence.
+  bool anyAlerting = false;
+  for (int i = 0; i < 21; i++) anyAlerting = anyAlerting || slotAlerting[i];
+  // The controller clears the old occurrence before sending its next group.
+  // Each member joins that group without erasing earlier LEDs or resetting time.
+  if (alerting && (!anyAlerting || millis() - alertStartedMs >= ALERT_DURATION_MS)) {
     for (int i = 0; i < 21; i++) slotAlerting[i] = false;
     allOff();
     alertStartedMs = millis();
@@ -325,6 +327,42 @@ void handleSchedule() {
   } else {
     server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Provide valid slot (0..20 or 21..41) or comp (A1..G3)\"}");
   }
+}
+
+// GET/POST /set-bulk-schedule or /bulk-schedule
+void handleBulkSchedule() {
+  sendCORSHeaders();
+  int count = 0;
+  if (server.hasArg("slots")) {
+    String sList = server.arg("slots");
+    int start = 0;
+    while (start < (int)sList.length()) {
+      int comma = sList.indexOf(',', start);
+      if (comma == -1) comma = sList.length();
+      int slot = sList.substring(start, comma).toInt();
+      if (slot >= 21) slot -= 21;
+      if (slot >= 0 && slot < 21) {
+        setScheduleSlot(slot, true);
+        count++;
+      }
+      start = comma + 1;
+    }
+  }
+  if (server.hasArg("compartments") || server.hasArg("comp")) {
+    String cList = server.hasArg("compartments") ? server.arg("compartments") : server.arg("comp");
+    cList.toUpperCase();
+    for (unsigned int i = 0; i + 1 < cList.length(); i++) {
+      if (cList[i] >= 'A' && cList[i] <= 'G' && cList[i+1] >= '1' && cList[i+1] <= '3') {
+        int slot = (cList[i+1] - '1') * 7 + (cList[i] - 'A');
+        if (slot >= 0 && slot < 21) {
+          setScheduleSlot(slot, true);
+          count++;
+        }
+        i++;
+      }
+    }
+  }
+  server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"bulk_scheduled\",\"count\":" + String(count) + "}");
 }
 
 // GET/POST /alert?slot=0 or ?slot=21 or ?comp=A1 (Called by ESP32-Mini when alarm is due!)
@@ -597,6 +635,10 @@ void setup() {
   server.on("/ping", HTTP_GET, handleStatus);
   server.on("/schedule", HTTP_GET, handleSchedule);
   server.on("/schedule", HTTP_POST, handleSchedule);
+  server.on("/set-bulk-schedule", HTTP_GET, handleBulkSchedule);
+  server.on("/set-bulk-schedule", HTTP_POST, handleBulkSchedule);
+  server.on("/bulk-schedule", HTTP_GET, handleBulkSchedule);
+  server.on("/bulk-schedule", HTTP_POST, handleBulkSchedule);
   server.on("/led", HTTP_GET, handleLed);
   server.on("/alert", HTTP_GET, handleAlert);
   server.on("/alert", HTTP_POST, handleAlert);
@@ -615,6 +657,8 @@ void setup() {
   server.on("/reed", HTTP_OPTIONS, handleOptions);
 
   server.on("/schedule", HTTP_OPTIONS, handleOptions);
+  server.on("/set-bulk-schedule", HTTP_OPTIONS, handleOptions);
+  server.on("/bulk-schedule", HTTP_OPTIONS, handleOptions);
   server.on("/alert", HTTP_OPTIONS, handleOptions);
   server.on("/clear-alert", HTTP_OPTIONS, handleOptions);
   server.on("/led", HTTP_OPTIONS, handleOptions);

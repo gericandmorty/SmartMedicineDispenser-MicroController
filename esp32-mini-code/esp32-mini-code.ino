@@ -73,6 +73,7 @@ Preferences preferences;
 // ── Schedule & Event Data Structures ─────────────────────────────────────────
 #define MAX_SCHEDULES  28
 #define MAX_EVENTS     20
+#define MAX_BULK_SLOTS 42
 #define GRACE_PERIOD_SECONDS 1200 // 20 minutes countdown window
 
 struct ReminderSchedule {
@@ -80,10 +81,11 @@ struct ReminderSchedule {
   int hour;             // 24-hour format: 0 - 23
   int minute;           // 0 - 59
   char date[16];        // "YYYY-MM-DD" or "" for repeating daily
-  char compartment[24]; // e.g. "Drawer 1 (A1)"
+  char compartment[224]; // e.g. "Drawer 1 (A1)" or "Drawer 1 (A1, A2, A3)"
   int slotIndex;        // 0 - 41
   bool active;
   unsigned long lastTriggeredDate; // YYYYMMDD, persisted to prevent replay after reboot.
+  char slots[128];       // Comma-separated slot indices e.g. "0,1,2"
 };
 
 ReminderSchedule schedules[MAX_SCHEDULES];
@@ -92,7 +94,7 @@ int scheduleCount = 0;
 struct DoseEventLog {
   char eventId[32];
   char scheduleId[32];
-  char compartment[24];
+  char compartment[224];
   char triggerTime[24];
   char resolvedTime[24];
   char resolution[16];  // "TAKEN", "TAKEN_MANUAL", "MISSED"
@@ -106,15 +108,17 @@ int eventCount = 0;
 struct ActiveAlertState {
   bool isAlerting;
   char scheduleId[32];
-  char compartment[24];
+  char compartment[224];
   int slotIndex;
   int relayNum;
   time_t alertStartEpoch;
   unsigned long lastReminderVibrateMs;
+  int alertSlots[MAX_BULK_SLOTS];
+  int alertSlotCount;
 };
 
 ActiveAlertState currentAlert = {
-  false, "", "", 0, 1, 0, 0
+  false, "", "", 0, 1, 0, 0, {0}, 0
 };
 
 // ── Vibration Motor State Machine (Non-blocking) ─────────────────────────────
@@ -411,6 +415,7 @@ void saveSchedulesToNVS() {
     preferences.putInt((pfx + "s").c_str(), schedules[i].slotIndex);
     preferences.putBool((pfx + "a").c_str(), schedules[i].active);
     preferences.putULong((pfx + "fired").c_str(), schedules[i].lastTriggeredDate);
+    preferences.putString((pfx + "slots").c_str(), schedules[i].slots);
   }
   preferences.end();
   Serial.printf("[NVS] Saved %d schedules to flash memory.\n", scheduleCount);
@@ -424,16 +429,18 @@ void loadSchedulesFromNVS() {
   for (int i = 0; i < scheduleCount; i++) {
     String pfx = "s" + String(i) + "_";
     String id = preferences.getString((pfx + "id").c_str(), "");
-    strncpy(schedules[i].id, id.c_str(), sizeof(schedules[i].id));
+    snprintf(schedules[i].id, sizeof(schedules[i].id), "%s", id.c_str());
     schedules[i].hour = preferences.getInt((pfx + "h").c_str(), 8);
     schedules[i].minute = preferences.getInt((pfx + "m").c_str(), 0);
     String d = preferences.getString((pfx + "d").c_str(), "");
-    strncpy(schedules[i].date, d.c_str(), sizeof(schedules[i].date));
+    snprintf(schedules[i].date, sizeof(schedules[i].date), "%s", d.c_str());
     String c = preferences.getString((pfx + "c").c_str(), "");
-    strncpy(schedules[i].compartment, c.c_str(), sizeof(schedules[i].compartment));
+    snprintf(schedules[i].compartment, sizeof(schedules[i].compartment), "%s", c.c_str());
     schedules[i].slotIndex = preferences.getInt((pfx + "s").c_str(), 0);
     schedules[i].active = preferences.getBool((pfx + "a").c_str(), true);
     schedules[i].lastTriggeredDate = preferences.getULong((pfx + "fired").c_str(), 0);
+    String sl = preferences.getString((pfx + "slots").c_str(), "");
+    snprintf(schedules[i].slots, sizeof(schedules[i].slots), "%s", sl.c_str());
   }
   preferences.end();
   Serial.printf("[NVS] Loaded %d schedules from flash.\n", scheduleCount);
@@ -446,22 +453,79 @@ int findScheduleIndex(const char* id) {
   return -1;
 }
 
-bool addOrUpdateSchedule(const char* id, int h, int m, const char* d, const char* c, int slot) {
+int parseCompartmentSlots(const String& compartment, const String& slotsStr, int defaultSlot, int outSlots[], int maxSlots) {
+  int count = 0;
+  if (slotsStr.length() > 0) {
+    int start = 0;
+    while (start < (int)slotsStr.length() && count < maxSlots) {
+      int comma = slotsStr.indexOf(',', start);
+      if (comma == -1) comma = slotsStr.length();
+      String token = slotsStr.substring(start, comma);
+      token.trim();
+      if (token.length() > 0) {
+        int s = token.toInt();
+        if (s >= 0 && s < 42) {
+          outSlots[count++] = s;
+        }
+      }
+      start = comma + 1;
+    }
+  }
+
+  if (count == 0) {
+    String compUpper = compartment;
+    compUpper.toUpperCase();
+    int currentDrawer = (compUpper.indexOf("DRAWER 2") != -1 || compUpper.indexOf("2:") == 0) ? 2 : 1;
+
+    for (unsigned int i = 0; i + 1 < compUpper.length() && count < maxSlots; i++) {
+      if (compUpper.substring(i).startsWith("DRAWER 2") || compUpper.substring(i).startsWith("2:")) {
+        currentDrawer = 2;
+      } else if (compUpper.substring(i).startsWith("DRAWER 1") || compUpper.substring(i).startsWith("1:")) {
+        currentDrawer = 1;
+      }
+
+      if (compUpper[i] >= 'A' && compUpper[i] <= 'G' && compUpper[i + 1] >= '1' && compUpper[i + 1] <= '3') {
+        int slot = (currentDrawer == 2 ? 21 : 0) + (compUpper[i + 1] - '1') * 7 + (compUpper[i] - 'A');
+        bool dup = false;
+        for (int k = 0; k < count; k++) {
+          if (outSlots[k] == slot) { dup = true; break; }
+        }
+        if (!dup) {
+          outSlots[count++] = slot;
+        }
+        i++;
+      }
+    }
+  }
+
+  if (count == 0 && defaultSlot >= 0 && defaultSlot < 42) {
+    outSlots[count++] = defaultSlot;
+  }
+  return count;
+}
+
+bool addOrUpdateSchedule(const char* id, int h, int m, const char* d, const char* c, int slot, const char* slotsStr = "") {
   int idx = findScheduleIndex(id);
   bool unchanged = idx >= 0 && schedules[idx].hour == h && schedules[idx].minute == m &&
                    strcmp(schedules[idx].date, d) == 0 &&
-                   strcmp(schedules[idx].compartment, c) == 0 && schedules[idx].slotIndex == slot;
+                   strcmp(schedules[idx].compartment, c) == 0 && schedules[idx].slotIndex == slot &&
+                   (slotsStr == NULL || strlen(slotsStr) == 0 || strcmp(schedules[idx].slots, slotsStr) == 0);
   if (idx == -1) {
     if (scheduleCount >= MAX_SCHEDULES) return false;
     idx = scheduleCount++;
   }
 
-  strncpy(schedules[idx].id, id, sizeof(schedules[idx].id));
+  snprintf(schedules[idx].id, sizeof(schedules[idx].id), "%s", id);
   schedules[idx].hour = h;
   schedules[idx].minute = m;
-  strncpy(schedules[idx].date, d, sizeof(schedules[idx].date));
-  strncpy(schedules[idx].compartment, c, sizeof(schedules[idx].compartment));
+  snprintf(schedules[idx].date, sizeof(schedules[idx].date), "%s", d);
+  snprintf(schedules[idx].compartment, sizeof(schedules[idx].compartment), "%s", c);
   schedules[idx].slotIndex = slot;
+  if (slotsStr != NULL && strlen(slotsStr) > 0) {
+    snprintf(schedules[idx].slots, sizeof(schedules[idx].slots), "%s", slotsStr);
+  } else if (!unchanged || strlen(schedules[idx].slots) == 0) {
+    snprintf(schedules[idx].slots, sizeof(schedules[idx].slots), "%d", slot);
+  }
   if (!unchanged) {
     schedules[idx].active = true;
     schedules[idx].lastTriggeredDate = 0;
@@ -507,9 +571,16 @@ void checkAlarms() {
       Serial.println("\n⌛ [ALERT TIMEOUT] 20 minutes elapsed without intake. Dose marked MISSED.");
       logDoseEvent(currentAlert.scheduleId, currentAlert.compartment, "MISSED", GRACE_PERIOD_SECONDS);
 
-      // Turn off alerting LED
-      int drawer = (currentAlert.slotIndex >= 21) ? 2 : 1;
-      notifyDrawerLED(drawer, currentAlert.slotIndex, "clear-alert");
+      // Turn off alerting LEDs
+      for (int s = 0; s < currentAlert.alertSlotCount; s++) {
+        int slot = currentAlert.alertSlots[s];
+        int drawer = (slot >= 21) ? 2 : 1;
+        notifyDrawerLED(drawer, slot, "clear-alert");
+      }
+      if (currentAlert.alertSlotCount == 0) {
+        int drawer = (currentAlert.slotIndex >= 21) ? 2 : 1;
+        notifyDrawerLED(drawer, currentAlert.slotIndex, "clear-alert");
+      }
 
       // Signal Arduino LCD
       Serial.printf("MISSED:%s\n", currentAlert.compartment);
@@ -541,15 +612,10 @@ void checkAlarms() {
   int currentMonth = timeinfo.tm_mon + 1;
   int currentYear = timeinfo.tm_year + 1900;
 
-  if (currentMinute == lastTriggeredMinute &&
-      currentHour == lastTriggeredHour &&
-      currentDay == lastTriggeredDay) {
-    return;
-  }
-
   char todayDateStr[16];
   snprintf(todayDateStr, sizeof(todayDateStr), "%04d-%02d-%02d", currentYear, currentMonth, timeinfo.tm_mday);
 
+  bool triggeredGroup = false;
   for (int i = 0; i < scheduleCount; i++) {
     if (!schedules[i].active || schedules[i].lastTriggeredDate == (unsigned long)currentDay) continue;
 
@@ -560,30 +626,52 @@ void checkAlarms() {
         Serial.printf("\n🚨 [ALARM TRIGGERED!] Time: %02d:%02d | Compartment: %s | ID: %s\n",
                       schedules[i].hour, schedules[i].minute, schedules[i].compartment, schedules[i].id);
 
+        bool extendGroup = triggeredGroup;
+        triggeredGroup = true;
         lastTriggeredMinute = currentMinute;
         lastTriggeredHour = currentHour;
         lastTriggeredDay = currentDay;
 
-        int drawer = (schedules[i].slotIndex >= 21) ? 2 : 1;
-
         // Clear the previous indication, including when it was in the other
         // drawer. Replacement is not a pickup confirmation.
-        if (currentAlert.isAlerting) {
-          int previousDrawer = currentAlert.slotIndex >= 21 ? 2 : 1;
-          notifyDrawerLED(previousDrawer, currentAlert.slotIndex, "clear-alert");
+        if (currentAlert.isAlerting && !extendGroup) {
+          for (int s = 0; s < currentAlert.alertSlotCount; s++) {
+            int slot = currentAlert.alertSlots[s];
+            int previousDrawer = slot >= 21 ? 2 : 1;
+            notifyDrawerLED(previousDrawer, slot, "clear-alert");
+          }
+          if (currentAlert.alertSlotCount == 0) {
+            int previousDrawer = currentAlert.slotIndex >= 21 ? 2 : 1;
+            notifyDrawerLED(previousDrawer, currentAlert.slotIndex, "clear-alert");
+          }
         }
         // Persist before notifying hardware so a reboot cannot replay this dose.
         schedules[i].lastTriggeredDate = currentDay;
         if (strlen(schedules[i].date) > 0) schedules[i].active = false;
         saveSchedulesToNVS();
 
+        // Parse slots for this schedule (bulk or single)
+        int alertSlots[MAX_BULK_SLOTS];
+        int alertCount = parseCompartmentSlots(schedules[i].compartment, schedules[i].slots, schedules[i].slotIndex, alertSlots, MAX_BULK_SLOTS);
+
         // 1. Start a fresh 20-minute window for the newly due occurrence.
         {
           currentAlert.isAlerting = true;
           strncpy(currentAlert.scheduleId, schedules[i].id, sizeof(currentAlert.scheduleId));
-          strncpy(currentAlert.compartment, schedules[i].compartment, sizeof(currentAlert.compartment));
-          currentAlert.slotIndex = schedules[i].slotIndex;
-          currentAlert.relayNum = drawer;
+          if (!extendGroup) currentAlert.compartment[0] = '\0';
+          String combined = String(currentAlert.compartment);
+          if (extendGroup) combined += "; ";
+          combined += String(schedules[i].compartment);
+          snprintf(currentAlert.compartment, sizeof(currentAlert.compartment), "%s", combined.c_str());
+          currentAlert.slotIndex = alertSlots[0];
+          if (!extendGroup) currentAlert.alertSlotCount = 0;
+          for (int s = 0; s < alertCount; s++) {
+            bool exists = false;
+            for (int k = 0; k < currentAlert.alertSlotCount; k++) if (currentAlert.alertSlots[k] == alertSlots[s]) exists = true;
+            if (!exists && currentAlert.alertSlotCount < MAX_BULK_SLOTS)
+              currentAlert.alertSlots[currentAlert.alertSlotCount++] = alertSlots[s];
+          }
+          currentAlert.relayNum = (alertSlots[0] >= 21) ? 3 : 1;
           currentAlert.alertStartEpoch = getCurrentEpoch();
           currentAlert.lastReminderVibrateMs = millis();
 
@@ -592,11 +680,20 @@ void checkAlarms() {
         }
 
         // 3. Trigger compartment LED on ESP1 (Drawer 1) or ESP2 (Drawer 2) for each scheduled item
-        notifyDrawerLED(drawer, schedules[i].slotIndex, "alert");
+        bool hasDrawer1 = false;
+        bool hasDrawer2 = false;
+        for (int s = 0; s < alertCount; s++) {
+          int slot = alertSlots[s];
+          int slotDrawer = (slot >= 21) ? 2 : 1;
+          if (slotDrawer == 1) hasDrawer1 = true;
+          if (slotDrawer == 2) hasDrawer2 = true;
+          notifyDrawerLED(slotDrawer, slot, "alert");
+        }
 
-        // 4. Trigger Hardware Relay & Arduino Buzzer/LCD for the specific drawer
-        triggerDispenseRelay(drawer == 2 ? 3 : 1);
-        notifyArduinoAlert(schedules[i].compartment, drawer);
+        // 4. Trigger Hardware Relay & Arduino Buzzer/LCD for the drawers
+        if (hasDrawer1) triggerDispenseRelay(1);
+        if (hasDrawer2) triggerDispenseRelay(3);
+
 
         // Reset timer so blocking HTTP calls to ESP1/ESP2 & Arduino do NOT consume vibration duration!
         vibrationStateTimer = millis();
@@ -604,6 +701,7 @@ void checkAlarms() {
       }
     }
   }
+  if (triggeredGroup) notifyArduinoAlert(currentAlert.compartment, 1);
 }
 
 // ── HTTP CORS Headers ────────────────────────────────────────────────────────
@@ -694,9 +792,16 @@ void handleStopVibrate() {
 
     logDoseEvent(currentAlert.scheduleId, currentAlert.compartment, "TAKEN", elapsed);
 
-    // Turn off alerting LED on the drawer
-    int drawer = (currentAlert.slotIndex >= 21) ? 2 : 1;
-    notifyDrawerLED(drawer, currentAlert.slotIndex, "clear-alert");
+    // Turn off alerting LED for all slots
+    for (int s = 0; s < currentAlert.alertSlotCount; s++) {
+      int slot = currentAlert.alertSlots[s];
+      int drawer = (slot >= 21) ? 2 : 1;
+      notifyDrawerLED(drawer, slot, "clear-alert");
+    }
+    if (currentAlert.alertSlotCount == 0) {
+      int drawer = (currentAlert.slotIndex >= 21) ? 2 : 1;
+      notifyDrawerLED(drawer, currentAlert.slotIndex, "clear-alert");
+    }
 
     // Signal Arduino over Serial & Wi-Fi
     notifyArduinoStop();
@@ -752,23 +857,35 @@ void handleAlert() {
     return;
   }
   drw = slot >= 21 ? 2 : 1;
-
-  bool duplicate = currentAlert.isAlerting && currentAlert.slotIndex == slot &&
+  String upperComp = comp;
+  upperComp.toUpperCase();
+  if (upperComp.indexOf("DRAWER") == -1) comp = "Drawer " + String(drw) + " (" + comp + ")";
+  int slots[MAX_BULK_SLOTS];
+  int count = parseCompartmentSlots(comp, "", slot, slots, MAX_BULK_SLOTS);
+  bool duplicate = currentAlert.isAlerting && currentAlert.alertSlotCount == count &&
                    comp == String(currentAlert.compartment);
+  for (int i = 0; i < count && duplicate; i++) duplicate = currentAlert.alertSlots[i] == slots[i];
   if (!duplicate) {
     if (currentAlert.isAlerting) {
-      notifyDrawerLED(currentAlert.slotIndex >= 21 ? 2 : 1, currentAlert.slotIndex, "clear-alert");
+      for (int i = 0; i < currentAlert.alertSlotCount; i++) {
+        int previous = currentAlert.alertSlots[i];
+        notifyDrawerLED(previous >= 21 ? 2 : 1, previous, "clear-alert");
+      }
     }
     currentAlert.isAlerting = true;
     strncpy(currentAlert.scheduleId, "remote_alert", sizeof(currentAlert.scheduleId));
-    strncpy(currentAlert.compartment, comp.c_str(), sizeof(currentAlert.compartment));
-    currentAlert.slotIndex = slot;
+    snprintf(currentAlert.compartment, sizeof(currentAlert.compartment), "%s", comp.c_str());
+    currentAlert.slotIndex = slots[0];
+    currentAlert.alertSlotCount = count;
+    for (int i = 0; i < count; i++) {
+      currentAlert.alertSlots[i] = slots[i];
+      notifyDrawerLED(slots[i] >= 21 ? 2 : 1, slots[i], "alert");
+    }
     currentAlert.relayNum = (drw == 2) ? 3 : 1;
     currentAlert.alertStartEpoch = getCurrentEpoch();
     currentAlert.lastReminderVibrateMs = millis();
   }
 
-  if (!duplicate) notifyDrawerLED(drw, slot, "alert");
   // Start continuous 1-minute vibration alert
   startVibrationAlert(1, 60000UL, 0);
   Serial.printf("[ALERT] Hardware alert received for %s (Drawer %d) -> Vibration active (60s)\n", comp.c_str(), drw);
@@ -865,6 +982,124 @@ void handleSetSchedule() {
   }
 }
 
+// GET/POST /set-bulk-schedule (or /bulk-schedule)
+// Schedules multiple compartments (e.g. A1, A2, A3) as one schedule entity
+void handleSetBulkSchedule() {
+  sendCORSHeaders();
+
+  String id = server.hasArg("id") ? server.arg("id") : String(millis());
+  int hour = server.hasArg("hour") ? server.arg("hour").toInt() : 8;
+  int minute = server.hasArg("minute") ? server.arg("minute").toInt() : 0;
+  String amPm = server.hasArg("amPm") ? server.arg("amPm") : "";
+  String date = server.hasArg("date") ? server.arg("date") : "";
+
+  String compartments = "";
+  if (server.hasArg("compartments")) compartments = server.arg("compartments");
+  else if (server.hasArg("compartment")) compartments = server.arg("compartment");
+
+  String slotsStr = server.hasArg("slots") ? server.arg("slots") : "";
+  int defaultDrawer = 1;
+  if (server.hasArg("drawer")) defaultDrawer = server.arg("drawer").toInt();
+
+  // If POST JSON body is provided
+  if (server.hasArg("plain")) {
+    String body = server.arg("plain");
+    int idIdx = body.indexOf("\"id\"");
+    if (idIdx != -1) {
+      int q1 = body.indexOf('"', idIdx + 4);
+      int q2 = body.indexOf('"', q1 + 1);
+      int q3 = body.indexOf('"', q2 + 1);
+      if (q2 != -1 && q3 != -1) id = body.substring(q2 + 1, q3);
+    }
+    int hIdx = body.indexOf("\"hour\"");
+    if (hIdx != -1) {
+      int col = body.indexOf(':', hIdx);
+      if (col != -1) hour = body.substring(col + 1).toInt();
+    }
+    int mIdx = body.indexOf("\"minute\"");
+    if (mIdx != -1) {
+      int col = body.indexOf(':', mIdx);
+      if (col != -1) minute = body.substring(col + 1).toInt();
+    }
+    int dIdx = body.indexOf("\"date\"");
+    if (dIdx != -1) {
+      int q1 = body.indexOf('"', dIdx + 6);
+      int q2 = body.indexOf('"', q1 + 1);
+      int q3 = body.indexOf('"', q2 + 1);
+      if (q2 != -1 && q3 != -1) date = body.substring(q2 + 1, q3);
+    }
+    int cIdx = body.indexOf("\"compartments\"");
+    if (cIdx != -1) {
+      int q1 = body.indexOf('"', cIdx + 14);
+      int q2 = body.indexOf('"', q1 + 1);
+      int q3 = body.indexOf('"', q2 + 1);
+      if (q2 != -1 && q3 != -1) compartments = body.substring(q2 + 1, q3);
+    }
+    int sIdx = body.indexOf("\"slots\"");
+    if (sIdx != -1) {
+      int q1 = body.indexOf('"', sIdx + 7);
+      int q2 = body.indexOf('"', q1 + 1);
+      int q3 = body.indexOf('"', q2 + 1);
+      if (q2 != -1 && q3 != -1) slotsStr = body.substring(q2 + 1, q3);
+    }
+  }
+
+  if (amPm.equalsIgnoreCase("AM")) {
+    if (hour == 12) hour = 0;
+  } else if (amPm.equalsIgnoreCase("PM")) {
+    if (hour != 12) hour += 12;
+  }
+
+  bool rtcCalibrated = false;
+  if (server.hasArg("client_epoch")) {
+    time_t clientEpoch = (time_t)server.arg("client_epoch").toInt();
+    time_t current = getCurrentEpoch();
+    if (abs((long)(clientEpoch - current)) > 5) {
+      struct timeval tv = { .tv_sec = clientEpoch, .tv_usec = 0 };
+      settimeofday(&tv, NULL);
+      rtcCalibrated = true;
+      Serial.printf("[RTC CALIBRATION] Synchronized drift (%ld sec)\n", (long)(clientEpoch - current));
+    }
+  }
+
+  String canonicalComp = compartments;
+  canonicalComp.trim();
+  String upperComp = canonicalComp;
+  upperComp.toUpperCase();
+  if (upperComp.indexOf("DRAWER") == -1 && canonicalComp.length() > 0) {
+    canonicalComp = "Drawer " + String(defaultDrawer) + " (" + canonicalComp + ")";
+  }
+  int parsedSlots[MAX_BULK_SLOTS];
+  int count = parseCompartmentSlots(canonicalComp, slotsStr, -1, parsedSlots, MAX_BULK_SLOTS);
+  if (count == 0 || hour < 0 || hour > 23 || minute < 0 || minute > 59 ||
+      canonicalComp.length() >= sizeof(schedules[0].compartment)) {
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid bulk schedule\"}");
+    return;
+  }
+
+  String normSlotsStr = "";
+  for (int s = 0; s < count; s++) {
+    if (s > 0) normSlotsStr += ",";
+    normSlotsStr += String(parsedSlots[s]);
+  }
+
+  int primarySlot = count > 0 ? parsedSlots[0] : 0;
+  bool success = addOrUpdateSchedule(id.c_str(), hour, minute, date.c_str(), canonicalComp.c_str(), primarySlot, normSlotsStr.c_str());
+
+  if (success) {
+    // Persisting the schedule is sufficient. Per-slot HTTP calls here delay
+    // the response beyond the app timeout; LEDs are sent when the dose is due.
+    String resp = "{\"status\":\"ok\",\"action\":\"bulk_schedule_saved\",\"id\":\"" + id +
+                  "\",\"compartment\":\"" + canonicalComp +
+                  "\",\"slots\":\"" + normSlotsStr +
+                  "\",\"slot_count\":" + String(count) +
+                  ",\"rtc_calibrated\":" + String(rtcCalibrated ? "true" : "false") + "}";
+    server.send(200, "application/json", resp);
+  } else {
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Failed to save bulk schedule\"}");
+  }
+}
+
 // GET /delete-schedule
 void handleDeleteSchedule() {
   sendCORSHeaders();
@@ -876,9 +1111,13 @@ void handleDeleteSchedule() {
   String id = server.arg("id");
   int idx = findScheduleIndex(id.c_str());
   if (idx != -1) {
-    int slot = schedules[idx].slotIndex;
-    int drawer = (slot >= 21) ? 2 : 1;
-    notifyDrawerLED(drawer, slot, "led?state=off");
+    int parsedSlots[MAX_BULK_SLOTS];
+    int count = parseCompartmentSlots(schedules[idx].compartment, schedules[idx].slots, schedules[idx].slotIndex, parsedSlots, MAX_BULK_SLOTS);
+    for (int s = 0; s < count; s++) {
+      int slot = parsedSlots[s];
+      int drawer = (slot >= 21) ? 2 : 1;
+      notifyDrawerLED(drawer, slot, "led?state=off");
+    }
   }
 
   bool success = deleteSchedule(id.c_str());
@@ -903,6 +1142,9 @@ void handleGetSchedules() {
     json += "\"compartment\":\"" + String(schedules[i].compartment) + "\",";
     json += "\"slotIndex\":" + String(schedules[i].slotIndex) + ",";
     json += "\"active\":" + String(schedules[i].active ? "true" : "false");
+    if (strlen(schedules[i].slots) > 0) {
+      json += ",\"slots\":\"" + String(schedules[i].slots) + "\"";
+    }
     json += "}";
   }
   json += "]";
@@ -1036,6 +1278,10 @@ void setup() {
   server.on("/solenoid", HTTP_POST, handleSolenoid);
   server.on("/set-schedule", HTTP_GET, handleSetSchedule);
   server.on("/set-schedule", HTTP_POST, handleSetSchedule);
+  server.on("/set-bulk-schedule", HTTP_GET, handleSetBulkSchedule);
+  server.on("/set-bulk-schedule", HTTP_POST, handleSetBulkSchedule);
+  server.on("/bulk-schedule", HTTP_GET, handleSetBulkSchedule);
+  server.on("/bulk-schedule", HTTP_POST, handleSetBulkSchedule);
   server.on("/delete-schedule", HTTP_GET, handleDeleteSchedule);
   server.on("/schedules", HTTP_GET, handleGetSchedules);
   server.on("/test-alert", HTTP_GET, handleTestAlert);
@@ -1045,6 +1291,8 @@ void setup() {
   server.on("/vibrate", HTTP_OPTIONS, handleOptions);
   server.on("/stop-vibrate", HTTP_OPTIONS, handleOptions);
   server.on("/set-schedule", HTTP_OPTIONS, handleOptions);
+  server.on("/set-bulk-schedule", HTTP_OPTIONS, handleOptions);
+  server.on("/bulk-schedule", HTTP_OPTIONS, handleOptions);
 
   server.begin();
   udpDiscovery.begin(UDP_DISCOVERY_PORT);
