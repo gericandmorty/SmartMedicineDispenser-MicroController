@@ -303,3 +303,117 @@ int main() {
 }
 '''
     run('master', code, temp)
+
+    # Exercise the actual master recovery function after a startup timeout and
+    # hotspot restart; the host shims cannot test radio/authentication behavior.
+    master = (ROOT / 'esp32-mini-code/esp32-mini-code.ino').read_text()
+    code = r'''
+constexpr int WL_CONNECTED = 3;
+const char* ssid = "test";
+struct IP { String toString() { return "192.168.1.10"; } };
+struct WiFiMock {
+  int state = 6, retries = 0;
+  int status() { return state; }
+  IP localIP() { return {}; }
+  void reconnect() { ++retries; }
+} WiFi;
+struct MDNSMock {
+  int starts = 0, stops = 0;
+  bool begin(const char*) { ++starts; return true; }
+  void end() { ++stops; }
+} MDNS;
+struct UDPMock {
+  int starts = 0, stops = 0;
+  void begin(int) { ++starts; }
+  void stop() { ++stops; }
+} udpDiscovery;
+int timeStarts = 0;
+void configTime(long, int, const char*, const char*) { ++timeStarts; }
+long gmtOffset_sec = 28800;
+int daylightOffset_sec = 0;
+const char *ntpServer1 = "test", *ntpServer2 = "test";
+const int UDP_DISCOVERY_PORT = 4210;
+String dynamicArduinoHost, dynamicDrawer1Host, dynamicDrawer2Host;
+'''
+    code += re.search(r'^bool wifiServicesReady =.*?^const unsigned long WIFI_RETRY_MS =.*?;', master, re.M | re.S).group()
+    code += '\n' + function(master, 'maintainWiFi')
+    code += r'''
+int main() {
+  fakeMillis = 20000; maintainWiFi();
+  assert(WiFi.retries == 0 && timeStarts == 0);
+  fakeMillis = 30000; maintainWiFi();
+  assert(WiFi.retries == 1);
+  fakeMillis = 30001; maintainWiFi(); assert(WiFi.retries == 1);
+  fakeMillis = 60000; maintainWiFi(); assert(WiFi.retries == 2);
+  WiFi.state = WL_CONNECTED; maintainWiFi();
+  assert(wifiServicesReady && timeStarts == 1);
+  assert(MDNS.starts == 1 && udpDiscovery.starts == 1);
+  maintainWiFi(); assert(timeStarts == 1 && WiFi.retries == 2);
+  dynamicArduinoHost = "old"; dynamicDrawer1Host = "old"; dynamicDrawer2Host = "old";
+  WiFi.state = 6; maintainWiFi();
+  assert(!wifiServicesReady && MDNS.stops == 1 && udpDiscovery.stops == 1);
+  assert(dynamicArduinoHost == "" && dynamicDrawer1Host == "" && dynamicDrawer2Host == "");
+  fakeMillis += 29999; maintainWiFi(); assert(WiFi.retries == 2);
+  fakeMillis += 1; maintainWiFi(); assert(WiFi.retries == 3);
+  WiFi.state = WL_CONNECTED; maintainWiFi();
+  assert(timeStarts == 2 && MDNS.starts == 2 && udpDiscovery.starts == 2);
+}
+'''
+    run('master_wifi_recovery', code, temp)
+
+    for drawer in ('esp1', 'esp2'):
+        source = (ROOT / drawer / (drawer + '.ino')).read_text()
+        code = r'''
+constexpr int WL_CONNECTED = 3;
+const char *ssid = "test", *hostName = "drawer";
+const int UDP_DISCOVERY_PORT = 4210;
+struct IP { String toString() { return "192.168.1.10"; } };
+struct WiFiMock {
+  int state = 6, retries = 0, scanResult = 2, scansDeleted = 0;
+  int status() { return state; }
+  bool reconnect() { ++retries; return true; }
+  IP localIP() { return {}; }
+  IP gatewayIP() { return {}; }
+  int RSSI(int i = 0) { return -50; }
+  int channel(int) { return 6; }
+  int encryptionType(int) { return 3; }
+  String SSID(int i) { return i == 0 ? "unrelated" : "test"; }
+  int scanNetworks(bool async, bool hidden) { assert(!async && hidden); return scanResult; }
+  void scanDelete() { ++scansDeleted; }
+} WiFi;
+struct MDNSMock {
+  int starts = 0, stops = 0;
+  bool begin(const char*) { ++starts; return true; }
+  void end() { ++stops; }
+} MDNS;
+struct UDPMock {
+  int starts = 0, stops = 0;
+  void begin(int) { ++starts; }
+  void stop() { ++stops; }
+} udpDiscovery;
+'''
+        code += re.search(r'^bool wifiServicesReady =.*?^const unsigned long WIFI_RETRY_MS =.*?;', source, re.M | re.S).group()
+        code += '\n' + function(source, 'maintainWiFi')
+        code += '\n' + function(source, 'diagnoseWiFiScan')
+        code += r'''
+int main() {
+  diagnoseWiFiScan(); assert(WiFi.scansDeleted == 1);
+  WiFi.scanResult = 0; diagnoseWiFiScan();
+  WiFi.scanResult = -2; diagnoseWiFiScan(); assert(WiFi.scansDeleted == 3);
+  fakeMillis = 15000; maintainWiFi();
+  assert(WiFi.retries == 0 && MDNS.starts == 0 && udpDiscovery.starts == 0);
+  fakeMillis = 30000; maintainWiFi(); assert(WiFi.retries == 1);
+  fakeMillis = 30001; maintainWiFi(); assert(WiFi.retries == 1);
+  fakeMillis = 60000; maintainWiFi(); assert(WiFi.retries == 2);
+  WiFi.state = WL_CONNECTED; maintainWiFi();
+  assert(wifiServicesReady && MDNS.starts == 1 && udpDiscovery.starts == 1);
+  maintainWiFi(); assert(MDNS.starts == 1 && WiFi.retries == 2);
+  WiFi.state = 6; maintainWiFi();
+  assert(!wifiServicesReady && MDNS.stops == 1 && udpDiscovery.stops == 1);
+  fakeMillis += 29999; maintainWiFi(); assert(WiFi.retries == 2);
+  fakeMillis += 1; maintainWiFi(); assert(WiFi.retries == 3);
+  WiFi.state = WL_CONNECTED; maintainWiFi();
+  assert(MDNS.starts == 2 && udpDiscovery.starts == 2);
+}
+'''
+        run(drawer + '_wifi_recovery', code, temp)

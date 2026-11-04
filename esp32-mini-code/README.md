@@ -2,6 +2,26 @@
 
 This directory contains the firmware for the **Master ESP32 Mini Controller**, which coordinates the entire physical dispenser system alongside **ESP1 (Drawer 1 LEDs)**, **ESP2 (Drawer 2 LEDs)**, and the **Arduino (LCD & Relays)**.
 
+## Wi-Fi connection troubleshooting
+
+Set `ssid` and `password` in `esp32-mini-code.ino` before uploading. Open Serial
+Monitor at 115200 baud and restart with the hotspot enabled. A connection is
+confirmed by `[WIFI] Connected! IP Address: ...`; configuring the HTTP server
+alone does not mean Wi-Fi is connected.
+
+The master logs `[WIFI] Disconnected: reason=...` with the ESP-IDF disconnect
+reason code, and explicitly retries every 30 seconds while offline. Capture
+the first disconnect messages as well as the retry status when troubleshooting;
+the codes provide evidence but do not always uniquely identify the cause.
+Discovery and NTP are initialized on a late connection and reinitialized after
+an observed disconnect. Test recovery by starting with the hotspot off, enabling
+it after startup, then switching it off and back on. Verify a new IP message and
+that the master is reachable at that address from a device on the same network.
+
+`python3 tests/run_behavior_tests.py` (from the microcontroller directory) tests
+retry timing and service recovery using host mocks. Board compilation and a real
+hotspot test are still required to verify radio and authentication behavior.
+
 ---
 
 ## 🏗️ Hardware Architecture Overview
