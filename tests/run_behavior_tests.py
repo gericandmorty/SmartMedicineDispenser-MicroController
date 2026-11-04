@@ -69,6 +69,15 @@ int main() {
   setTime(tomorrow, 11, 46); checkArduinoSchedules(); assert(!isAlertActive);
   setTime(tomorrow, 11, 47); checkArduinoSchedules();
   assert(isAlertActive && activeAlerts[0].shortLabel == "C1");
+  // Same minute, different drawers form one group; tomorrow's slot stays dark.
+  resolveDoseTaken(1);
+  scheduleCount = 3;
+  schedules[0] = {0,45,"Drawer 1 (A1, A2, A3)",1,tomorrow,0,true,"group1"};
+  schedules[1] = {0,45,"Drawer 2 (A1, A2, A3)",2,tomorrow,0,true,"group2"};
+  schedules[2] = {0,45,"Drawer 1 (C1)",1,tomorrow+1,0,true,"later"};
+  setTime(tomorrow, 0,45); checkArduinoSchedules();
+  assert(alertCount == 6);
+  assert(activeAlerts[0].drawer == 1 && activeAlerts[3].drawer == 2);
   // Buzzer remains eligible after the former 2-minute cutoff, expires at 20.
   pinState[REED_SWITCH_DRAWER1] = LOW; pinState[REED_SWITCH_DRAWER2] = LOW;
   fakeMillis = alertStartTime + 121000UL;
@@ -76,9 +85,19 @@ int main() {
   assert(isAlertActive && pinState[BUZZER_RELAY_PIN] == RELAY_ON);
   fakeMillis = alertStartTime + BUZZER_DURATION_MS; loop();
   assert(!isAlertActive && pinState[BUZZER_RELAY_PIN] == RELAY_OFF);
+  scheduleCount = 1;
+  schedules[0] = {11,45,"Drawer 1 (A1)",1,0,0,true,"daily"};
   // A retry within the picked-up minute must not reopen the same dose.
   fakeMillis += 1000; setTime(tomorrow + 1, 11, 45); checkArduinoSchedules();
   resolveDoseTaken(1); startAlert("Drawer 1 (A1)", 1); assert(!isAlertActive);
+  // Bulk alert on A1, A2, A3 treated as one alert with multi-compartment indication
+  startAlert("Drawer 1 (A1, A2, A3)", 1);
+  assert(alertCount == 3);
+  assert(activeAlerts[0].shortLabel == "A1");
+  assert(activeAlerts[1].shortLabel == "A2");
+  assert(activeAlerts[2].shortLabel == "A3");
+  resolveDoseTaken(1);
+  assert(!isAlertActive);
 }
 ''', temp)
 
@@ -102,10 +121,23 @@ int main() {
   setScheduleSlot(0); setScheduleSlot(1); setScheduleSlot(2);
   updateLEDState(); assertOnly(-1); // Future schedules do not light.
   for (int slot = 0; slot < 3; slot++) {
+    handleClearAlert(); // Controller clears the previous occurrence before sending a new group.
     fakeMillis += 60000; setAlertSlot(slot); updateLEDState(); assertOnly(slot);
     auto start = alertStartedMs; fakeMillis += 100;
     setAlertSlot(slot); assert(alertStartedMs == start); // Retry is idempotent.
   }
+  handleClearAlert();
+  fakeMillis += 60000;
+  for (int slot = 0; slot < 21; slot++) {
+    setAlertSlot(slot);
+    fakeMillis += 10; // Separate network deliveries must preserve the group.
+  }
+  updateLEDState();
+  for (int slot = 0; slot < 21; slot++) assert(pinState[ledPins[slot/7][slot%7]] == HIGH);
+  auto bulkStart = alertStartedMs;
+  for (int slot = 0; slot < 21; slot++) setAlertSlot(slot);
+  assert(alertStartedMs == bulkStart);
+  handleClearAlert();
   setAlertSlot(2, false); updateLEDState(); assertOnly(-1);
   setScheduleSlot(2); updateLEDState(); assertOnly(-1); // App sync cannot relight.
   fakeMillis += 60000; setAlertSlot(0); updateLEDState(); assertOnly(0);
@@ -125,6 +157,7 @@ int main() {
     source = (ROOT / 'esp32-mini-code/esp32-mini-code.ino').read_text()
     code = source[source.index('#define MAX_SCHEDULES'):source.index('// ── Vibration Motor State')]
     code += r'''
+#include <sys/time.h>
 ServerMock server;
 struct PreferencesMock {
   std::map<std::string, String> data;
@@ -169,7 +202,8 @@ void setTime(int day, int minute) {
 '''
     code += '\n'.join(function(source, name) for name in (
         'saveSchedulesToNVS', 'loadSchedulesFromNVS', 'findScheduleIndex',
-        'addOrUpdateSchedule', 'checkAlarms', 'handleStopVibrate', 'compartmentSlot', 'handleAlert'))
+        'parseCompartmentSlots', 'addOrUpdateSchedule', 'checkAlarms',
+        'handleStopVibrate', 'compartmentSlot', 'handleAlert', 'handleSetBulkSchedule'))
     code += r'''
 int main() {
   addOrUpdateSchedule("daily45", 11,45,"","Drawer 1 (A1)",0);
@@ -205,6 +239,67 @@ int main() {
   handleAlert(); assert(litSlot == 41);
   server.args["compartment"] = "Drawer 1 (B1)";
   handleAlert(); assert(litSlot == 1);
+  handleStopVibrate();
+  server.args["compartment"] = "Drawer 2 (A1, A2, A3)";
+  handleAlert();
+  assert(currentAlert.alertSlotCount == 3);
+  assert(currentAlert.alertSlots[0] == 21 && currentAlert.alertSlots[1] == 28 && currentAlert.alertSlots[2] == 35);
+  auto remoteStart = currentAlert.alertStartEpoch;
+  fakeEpoch += 1; handleAlert(); assert(currentAlert.alertStartEpoch == remoteStart);
+  handleStopVibrate(); assert(litSlot == -1);
+  // A1/A2/A3 are vertical slots 0/7/14, not 0/1/2.
+  addOrUpdateSchedule("bulk49", 11,49,"","Drawer 1 (A1, A2, A3)",0,"0,7,14");
+  setTime(31,49); checkAlarms();
+  assert(currentAlert.isAlerting && currentAlert.alertSlotCount == 3);
+  assert(currentAlert.alertSlots[0] == 0 && currentAlert.alertSlots[1] == 7 && currentAlert.alertSlots[2] == 14);
+  handleStopVibrate();
+  assert(!currentAlert.isAlerting && litSlot == -1);
+  server.args.clear();
+  server.args["id"] = "label-only";
+  server.args["compartments"] = "A1, A2, A3";
+  server.args["drawer"] = "2";
+  server.args["hour"] = "12";
+  server.args["minute"] = "0";
+  handleSetBulkSchedule();
+  int legacy = findScheduleIndex("label-only");
+  assert(legacy >= 0 && String(schedules[legacy].slots) == "21,28,35");
+  assert(String(schedules[legacy].compartment) == "Drawer 2 (A1, A2, A3)");
+  assert(litSlot == -1); // Saving must never send per-slot network commands.
+  addOrUpdateSchedule("group1", 0,52,"2026-11-04","Drawer 1 (A1, A2, A3)",0,"0,7,14");
+  addOrUpdateSchedule("group2", 0,52,"2026-11-04","Drawer 2 (A1, A2, A3)",21,"21,28,35");
+  addOrUpdateSchedule("tomorrow", 0,52,"2026-11-05","Drawer 1 (B1)",1);
+  setTime(35,52); fakeEpoch -= 11*3600; checkAlarms();
+  assert(currentAlert.alertSlotCount == 6);
+  assert(currentAlert.alertSlots[0] == 0 && currentAlert.alertSlots[3] == 21);
+  handleStopVibrate();
+  setTime(36,52); fakeEpoch -= 11*3600; checkAlarms();
+  assert(currentAlert.alertSlotCount == 1 && currentAlert.alertSlots[0] == 1);
+  handleStopVibrate();
+  String labels = "Drawer 2 (", slots = "";
+  for (int i = 0; i < 21; i++) {
+    if (i) { labels += ", "; slots += ","; }
+    labels += String(char('A' + i % 7)) + String(i / 7 + 1);
+    slots += String(i + 21);
+  }
+  labels += ")";
+  server.args["id"] = "full-drawer";
+  server.args["hour"] = "11";
+  server.args["minute"] = "50";
+  server.args["compartments"] = labels;
+  server.args["slots"] = slots;
+  handleSetBulkSchedule();
+  memset(schedules, 0, sizeof(schedules)); scheduleCount = 0;
+  loadSchedulesFromNVS();
+  int full = findScheduleIndex("full-drawer");
+  assert(String(schedules[full].compartment) == labels);
+  assert(String(schedules[full].slots) == slots);
+  setTime(31,50); checkAlarms();
+  assert(currentAlert.alertSlotCount == 21);
+  for (int i = 0; i < 21; i++) assert(currentAlert.alertSlots[i] == i + 21);
+  assert(String(currentAlert.compartment) == labels);
+  handleStopVibrate();
+  assert(!currentAlert.isAlerting && litSlot == -1);
+
 }
 '''
     run('master', code, temp)
