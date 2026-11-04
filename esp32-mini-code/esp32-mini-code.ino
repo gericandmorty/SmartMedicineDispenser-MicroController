@@ -1203,6 +1203,49 @@ void handleRoot() {
   server.send(200, "text/html", html);
 }
 
+// Event callbacks run on the Wi-Fi task: only log here; manage services in loop().
+void logWiFiDisconnect(WiFiEvent_t event, WiFiEventInfo_t info) {
+  Serial.printf("[WIFI] Disconnected: reason=%u (ESP-IDF reason code)\n",
+                unsigned(info.wifi_sta_disconnected.reason));
+}
+
+bool wifiServicesReady = false;
+unsigned long lastWiFiAttempt = 0;
+const unsigned long WIFI_RETRY_MS = 30000;
+
+void maintainWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiServicesReady) {
+      String ip = WiFi.localIP().toString();
+      Serial.printf("[WIFI] Connected! IP Address: %s\n", ip.c_str());
+      Serial.printf("IP:%s\n", ip.c_str());
+      if (MDNS.begin("dispenser")) {
+        Serial.println("[MDNS] Started: http://dispenser.local");
+      }
+      udpDiscovery.begin(UDP_DISCOVERY_PORT);
+      configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2);
+      wifiServicesReady = true;
+    }
+    return;
+  }
+
+  if (wifiServicesReady) {
+    udpDiscovery.stop();
+    MDNS.end();
+    // A hotspot can assign different addresses after restarting.
+    dynamicArduinoHost = "";
+    dynamicDrawer1Host = "";
+    dynamicDrawer2Host = "";
+    wifiServicesReady = false;
+    lastWiFiAttempt = millis();
+  }
+  if (millis() - lastWiFiAttempt >= WIFI_RETRY_MS) {
+    lastWiFiAttempt = millis();
+    Serial.printf("[WIFI] Retrying '%s'; status=%d\n", ssid, int(WiFi.status()));
+    WiFi.reconnect();
+  }
+}
+
 // ── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
@@ -1237,8 +1280,11 @@ void setup() {
   startVibrationAlert(1, 100, 50);
 
   // Start Wi-Fi in pure Station Mode (Direct connection to router, No Hotspot)
+  WiFi.onEvent(logWiFiDisconnect, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
+  lastWiFiAttempt = millis();
   WiFi.begin(ssid, password);
   Serial.printf("\n[WIFI] Connecting directly to '%s'...\n", ssid);
 
@@ -1249,17 +1295,9 @@ void setup() {
     retries++;
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    String localIPStr = WiFi.localIP().toString();
-    Serial.printf("\n[WIFI] Connected! IP Address: %s\n", localIPStr.c_str());
-    Serial.printf("IP:%s\n", localIPStr.c_str()); // Sent to Arduino to display on 16x2 LCD
-    if (MDNS.begin("dispenser")) {
-      Serial.println("[MDNS] Started: http://dispenser.local");
-    }
-    // NTP Time Sync
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2);
-  } else {
-    Serial.printf("\n[WIFI] ⚠️ Still attempting connection to '%s' in background...\n", ssid);
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("\n[WIFI] Not connected to '%s'; status=%d. Retrying every 30s.\n",
+                  ssid, int(WiFi.status()));
   }
 
   // Setup Web Server Endpoints
@@ -1295,8 +1333,8 @@ void setup() {
   server.on("/bulk-schedule", HTTP_OPTIONS, handleOptions);
 
   server.begin();
-  udpDiscovery.begin(UDP_DISCOVERY_PORT);
-  Serial.printf("[HTTP] Server listening on port 80\n[UDP] Auto-Discovery Beacon active on port %d\n", UDP_DISCOVERY_PORT);
+  maintainWiFi();
+  Serial.println("[HTTP] Server configured on port 80; reachable once Wi-Fi connects.");
 }
 
 // ── Handle Serial Messages from Arduino or Serial Monitor ───────────────────
@@ -1361,6 +1399,7 @@ void handleSerialFromArduino() {
 
 // ── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
+  maintainWiFi();
   server.handleClient();
   handleUDPDiscovery();
   updateVibrationState();

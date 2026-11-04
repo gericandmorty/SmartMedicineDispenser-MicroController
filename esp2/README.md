@@ -90,3 +90,23 @@ curl "http://dispenser-drawer2.local/clear"
    const char* password = "YOUR_WIFI_PASSWORD";
    ```
 5. Click **Upload**.
+
+## Hotspot diagnostics and recovery
+
+Set `ssid` and `password` in this board's `.ino` to the same hotspot credentials
+as the working Mini, then upload to the matching drawer board. Open Serial
+Monitor at 115200 baud and restart with the hotspot enabled. The startup scan
+prints whether the configured SSID is visible, with channel, RSSI and numeric
+authentication mode for matching networks. Passwords are not printed.
+
+Capture the startup scan, `begin status`, and `Disconnected: reason` messages
+through at least 60 seconds. A scan miss and an authentication failure need
+different troubleshooting; being configured for 2.4 GHz alone does not establish
+the cause. Only `Connected! IP: ...` confirms a connection.
+
+Offline retries occur every 30 seconds. mDNS and UDP discovery start on a late
+connection and restart after an observed disconnect. To bench-test recovery,
+boot with the hotspot off, enable it, then toggle it off/on again and verify the
+reported IP and discovery. The scan runs only at startup, before LED operation.
+Host regression tests cover retry timing and recovery, but do not verify the
+radio, hotspot authentication, or board compilation.

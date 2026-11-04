@@ -585,6 +585,64 @@ void handleSerialCommands() {
   }
 }
 
+// Wi-Fi events run on a separate task; only log from this callback.
+void logWiFiDisconnect(WiFiEvent_t event, WiFiEventInfo_t info) {
+  Serial.printf("[WIFI] Disconnected: reason=%u (201=no AP found, 202=auth failed, 204=handshake timeout, 36=station leaving)\n",
+                unsigned(info.wifi_sta_disconnected.reason));
+}
+
+// Scan once before connecting, never during normal LED/alarm operation.
+void diagnoseWiFiScan() {
+  Serial.printf("[WIFI] Scanning for configured SSID '%s'...\n", ssid);
+  int count = WiFi.scanNetworks(false, true);
+  bool found = false;
+  if (count < 0) {
+    Serial.printf("[WIFI] Scan failed: %d\n", count);
+  } else {
+    for (int i = 0; i < count; ++i) {
+      if (WiFi.SSID(i) == String(ssid)) {
+        found = true;
+        Serial.printf("[WIFI] Target found: channel=%d RSSI=%d dBm auth=%d\n",
+                      int(WiFi.channel(i)), int(WiFi.RSSI(i)), int(WiFi.encryptionType(i)));
+      }
+    }
+    if (!found) {
+      Serial.printf("[WIFI] Target not visible among %d networks. Check exact SSID, hotspot visibility and range.\n", count);
+    }
+  }
+  WiFi.scanDelete();
+}
+
+bool wifiServicesReady = false;
+unsigned long lastWiFiAttempt = 0;
+const unsigned long WIFI_RETRY_MS = 30000;
+
+void maintainWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiServicesReady) {
+      Serial.printf("[WIFI] Connected! IP: %s | Gateway: %s | RSSI: %d dBm\n",
+                    WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str(), WiFi.RSSI());
+      if (MDNS.begin(hostName)) {
+        Serial.printf("[MDNS] Started: http://%s.local\n", hostName);
+      }
+      udpDiscovery.begin(UDP_DISCOVERY_PORT);
+      wifiServicesReady = true;
+    }
+    return;
+  }
+  if (wifiServicesReady) {
+    udpDiscovery.stop();
+    MDNS.end();
+    wifiServicesReady = false;
+    lastWiFiAttempt = millis();
+  }
+  if (millis() - lastWiFiAttempt >= WIFI_RETRY_MS) {
+    lastWiFiAttempt = millis();
+    Serial.printf("[WIFI] Retrying '%s'; status=%d\n", ssid, int(WiFi.status()));
+    if (!WiFi.reconnect()) Serial.println("[WIFI] Reconnect request failed.");
+  }
+}
+
 // ── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
@@ -605,10 +663,13 @@ void setup() {
 
   // Connect to Wi-Fi
   Serial.printf("[WIFI] Connecting to '%s'...\n", ssid);
+  WiFi.onEvent(logWiFiDisconnect, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false); // Keeps radio active for instant ping & response
-  WiFi.begin(ssid, password);
+  diagnoseWiFiScan();
+  lastWiFiAttempt = millis();
+  Serial.printf("[WIFI] begin status=%d\n", int(WiFi.begin(ssid, password)));
 
   int retries = 0;
   while (WiFi.status() != WL_CONNECTED && retries < 30) {
@@ -617,16 +678,8 @@ void setup() {
     retries++;
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n[WIFI] Connected!");
-    Serial.printf("[WIFI] Drawer 2 IP Address: %s\n", WiFi.localIP().toString().c_str());
-    Serial.printf("[WIFI] Gateway: %s | RSSI: %d dBm\n", WiFi.gatewayIP().toString().c_str(), WiFi.RSSI());
-
-    if (MDNS.begin(hostName)) {
-      Serial.printf("[MDNS] Started: http://%s.local\n", hostName);
-    }
-  } else {
-    Serial.println("\n[WIFI] ⚠️ Wi-Fi not connected yet. Will retry in background.");
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("\n[WIFI] Not connected; status=%d. Retrying every 30s.\n", int(WiFi.status()));
   }
 
   // Setup Web Server Endpoints
@@ -664,8 +717,8 @@ void setup() {
   server.on("/led", HTTP_OPTIONS, handleOptions);
 
   server.begin();
-  udpDiscovery.begin(UDP_DISCOVERY_PORT);
-  Serial.printf("[HTTP] Server listening on port 80\n[UDP] Auto-Discovery active on port %d\n", UDP_DISCOVERY_PORT);
+  maintainWiFi();
+  Serial.println("[HTTP] Server configured on port 80; reachable once Wi-Fi connects.");
 
   // Visual startup verification sweep
   runStartupAnimation();
@@ -673,6 +726,7 @@ void setup() {
 
 // ── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
+  maintainWiFi();
   server.handleClient();
   updateLEDState();
   handleSerialCommands();
@@ -683,14 +737,6 @@ void loop() {
     udpDiscovery.beginPacket(IPAddress(255, 255, 255, 255), UDP_DISCOVERY_PORT);
     udpDiscovery.print("DISPENSER:ESP2:80");
     udpDiscovery.endPacket();
-  }
-
-  // Reconnect Wi-Fi if connection drops
-  static unsigned long lastReconnectCheck = 0;
-  if (WiFi.status() != WL_CONNECTED && (millis() - lastReconnectCheck >= 10000)) {
-    lastReconnectCheck = millis();
-    Serial.println("[WIFI] Reconnecting...");
-    WiFi.reconnect();
   }
 
   // Heartbeat every 10 seconds to Serial
