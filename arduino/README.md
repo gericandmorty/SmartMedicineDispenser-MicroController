@@ -59,12 +59,12 @@ Arduino GND        <──── ESP32 GND (Shared Common Ground)
 
 1. **Schedule Trigger:**
    * ESP32-Mini matches schedule time -> sends `ALERT:Drawer 1 (A1)` over Serial to Arduino.
-   * Arduino turns on **Buzzer Relay** (1 second on / 1 second off, up to 20 minutes).
+   * Arduino turns on **Buzzer Relay** (1 second on / 1 second off, up to 5 minutes).
    * Arduino energizes **Solenoid** to unlock the drawer.
-   * LCD begins displaying **20-minute live countdown**:
+   * LCD begins displaying **5-minute live countdown**:
      ```
      Line 1: DUE: Drawer 1(A1)
-     Line 2: 19m 58s left
+     Line 2: 04m 58s left
      ```
 
 2. **User Takes Medicine (Drawer Opens, Then Closes):**
@@ -79,8 +79,8 @@ Arduino GND        <──── ESP32 GND (Shared Common Ground)
    * Arduino sends `TAKEN:Drawer 1 (A1)` over Serial to ESP32-Mini.
    * ESP32-Mini stops vibration, turns off alerting LED on ESP1/ESP2, and marks status **`TAKEN`** on the Mobile App!
 
-3. **20-Minute Timeout (User Misses Dose):**
-   * If 20 minutes elapse without pickup confirmation:
+3. **5-Minute Timeout (User Misses Dose):**
+   * If 5 minutes elapse without pickup confirmation:
    * Arduino shuts off buzzer relay and locks solenoid.
    * LCD displays:
      ```

@@ -1,6 +1,6 @@
 // ==============================================================================
 //  SMART MEDICINE DISPENSER - ARDUINO CONTROLLER (UNO R3 / UNO R4 WiFi)
-//  Firmware Version: 3.4.0 (20-minute buzzer; one current dose; dated schedules)
+//  Firmware Version: 3.4.1 (5-minute buzzer; one current dose; dated schedules)
 // ==============================================================================
 //  Hardware Setup:
 //    1. I2C LCD 16x2 Display:
@@ -9,7 +9,7 @@
 //       - Auto-detects I2C Address: 0x27 or 0x3F
 //
 //    2. Buzzer Relay Module (1 GPIO):
-//       - Pin 7 -> Relay IN (1s BEEP / 1s PAUSE, 20-Minute Maximum Duration)
+//       - Pin 7 -> Relay IN (1s BEEP / 1s PAUSE, 5-Minute Maximum Duration)
 //
 //    3. Dual Solenoid Locks (Connected to Relay Module - Active-LOW):
 //       - Pin 8 -> Relay IN (Controls Solenoid Lock for Drawer 1)
@@ -30,9 +30,9 @@
 //       - When Drawer 2 is due: Pin 9 Relay activates to unlock Drawer 2 solenoid.
 //       - When Drawer 1 is pulled open: Pin 8 Relay locks after 3s.
 //       - When Drawer 2 is pulled open: Pin 9 Relay locks after 3s.
-//    2. 20-Minute Buzzer Cutoff:
-//       - Buzzer beeps (1s ON / 1s OFF) for 20 minutes max, then silences.
-//       - 20-minute alert grace period and live countdown share the buzzer limit.
+//    2. 5-Minute Buzzer Cutoff:
+//       - Buzzer beeps (1s ON / 1s OFF) for 5 minutes max, then silences.
+//       - The alert and countdown end with the five-minute buzzer window.
 //    3. Magnetic Reed Switch & LED Behavior:
 //       - Drawer 1 Reed Switch (Pin 2) controls ESP1 LEDs (Drawer 1 Matrix).
 //       - Drawer 2 Reed Switch (Pin 3) controls ESP2 LEDs (Drawer 2 Matrix).
@@ -93,8 +93,8 @@ const int SOLENOID_ON   = LOW;  // Relay LOW -> Energizes Solenoid (Unlocks Door
 const int SOLENOID_OFF  = HIGH; // Relay HIGH -> De-energizes Solenoid (Locks Door)
 
 // ── Timing Configurations ────────────────────────────────────────────────────
-const unsigned long GRACE_PERIOD_MS    = 20UL * 60UL * 1000UL; // 20 mins = 1,200,000 ms
-const unsigned long BUZZER_DURATION_MS = 20UL * 60UL * 1000UL; // Real scheduled alerts: 20 minutes
+const unsigned long GRACE_PERIOD_MS    = 5UL * 60UL * 1000UL; // 5 minutes
+const unsigned long BUZZER_DURATION_MS = 5UL * 60UL * 1000UL; // Real scheduled alerts: 5 minutes
 const unsigned long STARTUP_BEEP_MS    = 10UL * 1000UL;         // Boot indication only: 10 seconds
 
 // Initialize 16x2 I2C LCD (Auto-detected in setup to 0x27 or 0x3F)
@@ -126,16 +126,22 @@ const unsigned long DISPLAY_CYCLE_INTERVAL_MS = 2000; // Increment every 2 secon
 // ── Alert State Variables ────────────────────────────────────────────────────
 bool isAlertActive = false;
 unsigned long alertStartTime = 0;
-unsigned long buzzerStartTime = 0; // New due events restart their own 20-minute buzzing window.
+unsigned long buzzerStartTime = 0; // New due events restart their own 5-minute buzzing window.
 bool startupBeepActive = false;
 unsigned long startupBeepStartMs = 0;
 
-// Buzzer Cadence (1s BEEP / 1s PAUSE during the 20-minute buzzing window)
+// Buzzer Cadence (1s BEEP / 1s PAUSE during the 5-minute buzzing window)
 bool buzzerState = false;
 bool buzzerMutedByDrawer = false; // Keep it silent after an alerting drawer opens.
 unsigned long lastBuzzerToggle = 0;
 const unsigned long BUZZER_BEEP_MS  = 1000; // 1s BEEP
 const unsigned long BUZZER_PAUSE_MS = 1000; // 1s PAUSE
+// Three quick 100ms chirps when a drawer's due medicine is collected.
+const unsigned long COMPLETION_CHIRP_MS = 100;
+const unsigned long COMPLETION_PATTERN_MS = 600;
+bool completionChimeActive = false;
+unsigned long completionChimeStart = 0;
+
 
 // Non-blocking Solenoid Relock Timers (Independent per drawer)
 unsigned long solenoid1OffTime = 0;
@@ -476,6 +482,7 @@ void clearCurrentCompartmentLEDs() {
 
 // A new due time replaces the previous indication. Never treat a replaced
 // occurrence as picked up; only an actual pickup confirms the current dose.
+void resolveDoseMissed();
 void startAlert(const String& rawComp, int drawerNum = 1) {
   String token = rawComp;
   token.trim();
@@ -533,8 +540,9 @@ void startAlert(const String& rawComp, int drawerNum = 1) {
     count = 1;
   }
 
+  // A later due time supersedes any uncollected compartments in the current alert.
+  if (isAlertActive) resolveDoseMissed();
   clearCurrentCompartmentLEDs();
-  if (isAlertActive) lockDrawer(0);
   alertCount = count;
   for (int i = 0; i < count; i++) {
     activeAlerts[i].shortLabel = labels[i];
@@ -548,6 +556,7 @@ void startAlert(const String& rawComp, int drawerNum = 1) {
   lastDoseTaken = false;
   alertStartTime = millis();
   buzzerStartTime = alertStartTime;
+  completionChimeActive = false;
   buzzerMutedByDrawer = false;
   for (int i = 0; i < count; i++) {
     if ((drawers[i] == 2 && drawer2IsOpen) || (drawers[i] == 1 && drawer1IsOpen)) {
@@ -566,7 +575,7 @@ void startAlert(const String& rawComp, int drawerNum = 1) {
     notifyCompartmentLED(labels[i], drawers[i], true);
   }
   notifyESP32Vibrate(true);
-  Serial.println("[ARDUINO] Current dose: " + token + "; buzzer and countdown: 20 minutes.");
+  Serial.println("[ARDUINO] Current dose: " + token + "; buzzer: 5 minutes; countdown: 5 minutes.");
 }
 
 // ── Resolve Doses in Drawer (Magnetic Reed Switch Triggered) ──────────────────
@@ -596,6 +605,13 @@ void resolveDoseTaken(int drawerNum) {
 
   if (takenFromThisDrawer == 0) return;
 
+  // Each drawer gets one distinct completion sound, including when the other
+  // drawer still has medicine due. The relay controls cadence, not pitch.
+  completionChimeActive = true;
+  completionChimeStart = millis();
+  buzzerState = true;
+  writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_ON);
+
   // Relock this drawer's solenoid relay after 3s delay (so user can close drawer)
   if (drawerNum == 1 || drawerNum == 0) {
     solenoid1OffTime = millis() + 3000;
@@ -619,8 +635,7 @@ void resolveDoseTaken(int drawerNum) {
     lastDoseTakenMillis = millis();
     lastDoseTakenDrawer = drawerNum;
     lastTakenSummary = takenSummary;
-    writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
-    buzzerState = false;
+    // Keep the completion chirp running after the alert itself resolves.
     buzzerMutedByDrawer = false;
 
     // Silence ESP32 vibration
@@ -634,7 +649,9 @@ void resolveDoseTaken(int drawerNum) {
     Serial.print(elapsedSec);
     Serial.println("s.");
   } else {
-    // Doses in other drawer still pending
+    // Doses in the other drawer still pending. Resume its normal cadence
+    // after the short completion chirp if its five-minute window remains.
+    buzzerMutedByDrawer = false;
     updateDisplay("DOSE TAKEN! :)", takenSummary + " OK");
     scheduleIdleScreen(2500);
     Serial.print("[ARDUINO] ✅ Drawer ");
@@ -645,7 +662,7 @@ void resolveDoseTaken(int drawerNum) {
   }
 }
 
-// ── Resolve Dose: MISSED (20-Minute Timeout Exceeded) ────────────────────────
+// ── Resolve Dose: MISSED (5-Minute Timeout Exceeded) ─────────────────────────
 void resolveDoseMissed() {
   clearCurrentCompartmentLEDs();
   isAlertActive = false;
@@ -655,6 +672,7 @@ void resolveDoseMissed() {
   lockDrawer(0);
   buzzerState = false;
   buzzerMutedByDrawer = false;
+  completionChimeActive = false;
 
   // Silence ESP32 vibration
   notifyESP32Vibrate(false);
@@ -673,7 +691,7 @@ void resolveDoseMissed() {
   scheduleIdleScreen(5000);
   alertCount = 0;
 
-  Serial.println("[ARDUINO] ⌛ 20-Minute Grace Period Expired: Marked MISSED.");
+  Serial.println("[ARDUINO] ⌛ 5-Minute Grace Period Expired: Marked MISSED.");
 }
 
 // ── Non-Blocking Manual Dispense Pulse (5 Seconds) ───────────────────────────
@@ -1151,7 +1169,7 @@ void setup() {
   lastBuzzerToggle = startupBeepStartMs;
   buzzerState = true;
   writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_ON);
-  Serial.println("[ARDUINO] Startup beep: 10 seconds maximum; scheduled alerts still beep 20 minutes.");
+  Serial.println("[ARDUINO] Startup beep: 10 seconds maximum; scheduled alerts beep 5 minutes.");
   Serial.println("[ARDUINO] Ready! Dual Solenoid Relays (Pin 8 & 9) + Reed Switches (Pin 2 & 3).");
 }
 
@@ -1170,7 +1188,7 @@ void loop() {
   checkMagneticReedSwitches();
 
   // 3. Startup notification (10 seconds max, 1s ON / 1s OFF).
-  // A real scheduled alert cancels this and uses its separate 20-minute timer.
+  // A real scheduled alert cancels this and uses its separate 5-minute buzzer timer.
   if (startupBeepActive && !isAlertActive && !buzzerPulseActive) {
     unsigned long now = millis();
     if (now - startupBeepStartMs >= STARTUP_BEEP_MS) {
@@ -1185,18 +1203,20 @@ void loop() {
     }
   }
 
-  // 4. Active 20-Minute Alert State Machine & 20-Minute Buzzer Cutoff
+  // 4. Active 5-Minute Alert State Machine & Buzzer Cutoff
   if (isAlertActive) {
     unsigned long elapsed = millis() - alertStartTime;
 
-    // A. Check 20-minute grace period expiry (Timeout -> MISSED)
+    // A. Check 5-minute grace period expiry (Timeout -> MISSED)
     if (elapsed >= GRACE_PERIOD_MS) {
       resolveDoseMissed();
     } else {
       unsigned long now = millis();
 
-      // B. Buzzer Beeps ONLY for the first 20 minutes (1,200,000 ms)
-      if (!buzzerMutedByDrawer && (now - buzzerStartTime) < BUZZER_DURATION_MS) {
+      // B. Buzzer Beeps ONLY for the first 5 minutes (300,000 ms)
+      if (completionChimeActive) {
+        // The distinct completion chirp has priority over the due-dose cadence.
+      } else if (!buzzerMutedByDrawer && (now - buzzerStartTime) < BUZZER_DURATION_MS) {
         if (buzzerState && (now - lastBuzzerToggle >= BUZZER_BEEP_MS)) {
           buzzerState = false;
           writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
@@ -1207,11 +1227,11 @@ void loop() {
           lastBuzzerToggle = now;
         }
       } else {
-        // Scheduled 20-minute buzzer cutoff reached or drawer was opened.
+        // Scheduled 5-minute buzzer cutoff reached or drawer was opened.
         if (buzzerState) {
           buzzerState = false;
           writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
-          Serial.println("[ARDUINO] 20-Minute Buzzing Timeout: Buzzer silenced (drawer opened or alert window expired).");
+          Serial.println("[ARDUINO] 5-Minute Buzzing Timeout: Buzzer silenced (drawer opened or alert window expired).");
         }
       }
 
@@ -1267,7 +1287,7 @@ void loop() {
         writeLCDLine(0, line1);
       }
 
-      // D. Line 2: 20-Minute Countdown Display (Updated once per second)
+      // D. Line 2: 5-Minute Countdown Display (Updated once per second)
       if (now - lastCountdownUpdate >= 1000) {
         lastCountdownUpdate = now;
         unsigned long remainingMs = GRACE_PERIOD_MS - elapsed;
@@ -1317,6 +1337,20 @@ void loop() {
       writeRelayQuietly(SOLENOID_DRAWER2_PIN, SOLENOID_OFF);
       solenoid2PulseActive = false;
       Serial.println("[ARDUINO] Solenoid Relay 2 (Drawer 2 / Pin 9) Relocked.");
+    }
+  }
+
+  // Three short chirps: ON/OFF every 100ms, then silence. A still-active
+  // alert can resume its usual cadence on the following loop.
+  if (completionChimeActive) {
+    unsigned long elapsedChime = millis() - completionChimeStart;
+    bool chirpOn = elapsedChime < COMPLETION_PATTERN_MS &&
+                   ((elapsedChime / COMPLETION_CHIRP_MS) % 2 == 0);
+    writeRelayQuietly(BUZZER_RELAY_PIN, chirpOn ? RELAY_ON : RELAY_OFF);
+    buzzerState = chirpOn;
+    if (elapsedChime >= COMPLETION_PATTERN_MS) {
+      completionChimeActive = false;
+      lastBuzzerToggle = millis();
     }
   }
 

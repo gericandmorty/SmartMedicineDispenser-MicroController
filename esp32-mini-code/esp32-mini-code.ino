@@ -8,7 +8,7 @@
 
 // ==============================================================================
 //  SMART MEDICINE DISPENSER - ESP32 MINI MASTER CONTROLLER
-//  Firmware Version: 2.1 (Full 20-Min Grace Period + Auto-Discovery UDP + Wi-Fi)
+//  Firmware Version: 2.1 (5-Min Grace Period + Auto-Discovery UDP + Wi-Fi)
 // ==============================================================================
 
 // ── Wi-Fi Configuration ──────────────────────────────────────────────────────
@@ -74,7 +74,7 @@ Preferences preferences;
 #define MAX_SCHEDULES  28
 #define MAX_EVENTS     20
 #define MAX_BULK_SLOTS 42
-#define GRACE_PERIOD_SECONDS 1200 // 20 minutes countdown window
+#define GRACE_PERIOD_SECONDS 300 // 5 minutes countdown window
 
 struct ReminderSchedule {
   char id[32];
@@ -104,7 +104,7 @@ struct DoseEventLog {
 DoseEventLog eventHistory[MAX_EVENTS];
 int eventCount = 0;
 
-// ── Active Alert State (20-Minute Countdown) ─────────────────────────────────
+// ── Active Alert State (5-Minute Countdown) ──────────────────────────────────
 struct ActiveAlertState {
   bool isAlerting;
   char scheduleId[32];
@@ -548,13 +548,13 @@ bool deleteSchedule(const char* id) {
   return true;
 }
 
-// ── Check Alarms & Trigger 20-Min Grace Period ───────────────────────────────
+// ── Check Alarms & Trigger 5-Min Grace Period ────────────────────────────────
 void checkAlarms() {
   static unsigned long lastCheckTime = 0;
   if (millis() - lastCheckTime < 1000) return; // Check once per second
   lastCheckTime = millis();
 
-  // If an alert is already actively ticking within its 20-min window:
+  // If an alert is already actively ticking within its 5-min window:
   if (currentAlert.isAlerting) {
     time_t now = getCurrentEpoch();
     int elapsed = (int)(now - currentAlert.alertStartEpoch);
@@ -566,9 +566,9 @@ void checkAlarms() {
       Serial.println("[ALERT] Periodic 3-minute reminder vibration pulse fired.");
     }
 
-    // 20-minute window expired (1200 seconds) -> MISSED
+    // 5-minute window expired (300 seconds) -> MISSED
     if (elapsed >= GRACE_PERIOD_SECONDS) {
-      Serial.println("\n⌛ [ALERT TIMEOUT] 20 minutes elapsed without intake. Dose marked MISSED.");
+      Serial.println("\n⌛ [ALERT TIMEOUT] 5 minutes elapsed without intake. Dose marked MISSED.");
       logDoseEvent(currentAlert.scheduleId, currentAlert.compartment, "MISSED", GRACE_PERIOD_SECONDS);
 
       // Turn off alerting LEDs
@@ -633,8 +633,12 @@ void checkAlarms() {
         lastTriggeredDay = currentDay;
 
         // Clear the previous indication, including when it was in the other
-        // drawer. Replacement is not a pickup confirmation.
+        // drawer. A later due time ends the unconfirmed dose as MISSED.
         if (currentAlert.isAlerting && !extendGroup) {
+          int previousElapsed = (int)(getCurrentEpoch() - currentAlert.alertStartEpoch);
+          if (previousElapsed < 0) previousElapsed = 0;
+          logDoseEvent(currentAlert.scheduleId, currentAlert.compartment, "MISSED", previousElapsed);
+          Serial.printf("MISSED:%s\n", currentAlert.compartment);
           for (int s = 0; s < currentAlert.alertSlotCount; s++) {
             int slot = currentAlert.alertSlots[s];
             int previousDrawer = slot >= 21 ? 2 : 1;
@@ -654,7 +658,7 @@ void checkAlarms() {
         int alertSlots[MAX_BULK_SLOTS];
         int alertCount = parseCompartmentSlots(schedules[i].compartment, schedules[i].slots, schedules[i].slotIndex, alertSlots, MAX_BULK_SLOTS);
 
-        // 1. Start a fresh 20-minute window for the newly due occurrence.
+        // 1. Start a fresh 5-minute window for the newly due occurrence.
         {
           currentAlert.isAlerting = true;
           strncpy(currentAlert.scheduleId, schedules[i].id, sizeof(currentAlert.scheduleId));
@@ -1373,7 +1377,7 @@ void handleSerialFromArduino() {
       Serial.println("[SERIAL <- ARDUINO] Drawer 2 CLOSED -> Telling ESP2 to turn OFF all LEDs!");
       notifyDrawerDoorState(2, false);
     } else if (msg.startsWith("MISSED:")) {
-      Serial.println("[SERIAL <- ARDUINO] 20-Minute Grace Period Expired: MISSED");
+      Serial.println("[SERIAL <- ARDUINO] 5-Minute Grace Period Expired: MISSED");
     } else if (msg.equalsIgnoreCase("IP") || msg.equalsIgnoreCase("STATUS") || msg.equalsIgnoreCase("WIFI")) {
       Serial.println("\n============== ESP32-MINI STATUS ==============");
       if (WiFi.status() == WL_CONNECTED) {
