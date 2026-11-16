@@ -63,10 +63,10 @@ int main() {
   assert(pinState[SOLENOID_DRAWER1_PIN] == SOLENOID_OFF);
   resolveDoseTaken(1); assert(isAlertActive); // Wrong drawer cannot confirm.
   resolveDoseTaken(2); assert(!isAlertActive);
-  assert(completionChimeActive && pinState[BUZZER_RELAY_PIN] == RELAY_ON);
-  fakeMillis += 100; loop(); assert(pinState[BUZZER_RELAY_PIN] == RELAY_OFF);
-  fakeMillis += 100; loop(); assert(pinState[BUZZER_RELAY_PIN] == RELAY_ON);
-  fakeMillis += 400; loop(); assert(!completionChimeActive && pinState[BUZZER_RELAY_PIN] == RELAY_OFF);
+  assert(unresolvedMissedDose && !completionChimeActive);
+  assert(pinState[BUZZER_RELAY_PIN] == RELAY_OFF);
+  fakeMillis += 500; loop(); assert(pinState[BUZZER_RELAY_PIN] == RELAY_OFF);
+  processSerialCommand("ACK_MISSED"); assert(!unresolvedMissedDose);
   checkArduinoSchedules(); assert(!isAlertActive); // No relight after pickup.
   setTime(today, 11, 47); checkArduinoSchedules(); assert(!isAlertActive);
   setTime(tomorrow, 11, 45); checkArduinoSchedules(); assert(isAlertActive);
@@ -90,9 +90,8 @@ int main() {
   loop(); fakeMillis += 1000; loop();
   assert(isAlertActive && pinState[BUZZER_RELAY_PIN] == RELAY_ON);
   fakeMillis = alertStartTime + BUZZER_DURATION_MS; loop();
-  assert(!isAlertActive && pinState[BUZZER_RELAY_PIN] == RELAY_OFF);
-  fakeMillis = alertStartTime + GRACE_PERIOD_MS; loop();
-  assert(!isAlertActive && pinState[BUZZER_RELAY_PIN] == RELAY_OFF);
+  assert(!isAlertActive && unresolvedMissedDose && pinState[BUZZER_RELAY_PIN] == RELAY_OFF);
+  processSerialCommand("ACK_MISSED");
   scheduleCount = 1;
   schedules[0] = {11,45,"Drawer 1 (A1)",1,0,0,true,"daily"};
   // A retry within the picked-up minute must not reopen the same dose.
@@ -106,6 +105,65 @@ int main() {
   assert(activeAlerts[2].shortLabel == "A3");
   resolveDoseTaken(1);
   assert(!isAlertActive);
+
+  // An open A1 drawer survives a new A2 alarm: A1 is missed, A2 still sounds,
+  // and A1's five-minute deadline starts a distinct 30-second fast warning.
+  fakeMillis += 60000;
+  drawer1IsOpen = true;
+  pinState[REED_SWITCH_DRAWER1] = HIGH;
+  lastReed1State = HIGH;
+  startAlert("Drawer 1 (D1)", 1);
+  assert(unclosedDrawerTracking[0] && pinState[BUZZER_RELAY_PIN] == RELAY_ON);
+  auto firstDoseStart = alertStartTime;
+  fakeMillis = firstDoseStart + 120000UL;
+  startAlert("Drawer 1 (E1)", 1);
+  assert(isAlertActive && activeAlerts[0].shortLabel == "E1");
+  assert(pinState[BUZZER_RELAY_PIN] == RELAY_OFF && unclosedDrawerTracking[0] && unresolvedMissedDose);
+  fakeMillis = firstDoseStart + GRACE_PERIOD_MS;
+  loop();
+  assert(unclosedWarningActive && unclosedWarningDrawer == 1);
+  assert(pinState[BUZZER_RELAY_PIN] == RELAY_ON);
+  fakeMillis += UNCLOSED_WARNING_BEEP_MS;
+  loop(); assert(pinState[BUZZER_RELAY_PIN] == RELAY_OFF);
+  fakeMillis += UNCLOSED_WARNING_PAUSE_MS;
+  loop(); assert(pinState[BUZZER_RELAY_PIN] == RELAY_ON);
+  fakeMillis = unclosedWarningStart + 60000UL;
+  loop(); assert(unclosedWarningActive && cabinetCloseRequired && lastToneFrequency > 0);
+
+  // A single missed dose also warns at five minutes; closing silences it early.
+  fakeMillis += 60000;
+  startAlert("Drawer 1 (F1)", 1);
+  auto finalDoseStart = alertStartTime;
+  fakeMillis = finalDoseStart + GRACE_PERIOD_MS;
+  loop(); assert(unresolvedMissedDose && !isAlertActive);
+  pinState[REED_SWITCH_DRAWER1] = LOW;
+  lastReed1State = LOW;
+  lastDebounceTime1 = fakeMillis - DEBOUNCE_DELAY_MS - 1;
+  fakeMillis += 100;
+  loop(); assert(!missedWarningActive && pinState[BUZZER_RELAY_PIN] == RELAY_OFF);
+  assert(!cabinetCloseRequired && lastToneFrequency == 0);
+
+  // Manual TAKEN while open starts an immediate alarm, independent of dose timeout.
+  fakeMillis += 60000;
+  drawer1IsOpen = true; drawer2IsOpen = true;
+  pinState[REED_SWITCH_DRAWER1] = HIGH; pinState[REED_SWITCH_DRAWER2] = HIGH;
+  startAlert("Drawer 1 (G1)", 1);
+  resolveDoseTaken(1);
+  updateCabinetWarning();
+  assert(!isAlertActive && cabinetCloseRequired && unclosedWarningActive);
+  fakeMillis += 3600000UL; updateCabinetWarning();
+  assert(cabinetCloseRequired && lastToneFrequency > 0);
+  drawer1IsOpen = false; pinState[REED_SWITCH_DRAWER1] = LOW;
+  updateCabinetWarning(); assert(cabinetCloseRequired); // Other drawer still open.
+  drawer2IsOpen = false; pinState[REED_SWITCH_DRAWER2] = LOW;
+  lastDebounceTime2 = fakeMillis;
+  updateCabinetWarning(); assert(cabinetCloseRequired); // Contact not stable yet.
+  fakeMillis += DEBOUNCE_DELAY_MS + 1;
+  pinState[REED_SWITCH_DRAWER2] = HIGH;
+  updateCabinetWarning(); assert(cabinetCloseRequired); // Bouncing/open raw contact.
+  pinState[REED_SWITCH_DRAWER2] = LOW;
+  updateCabinetWarning();
+  assert(!cabinetCloseRequired && !unclosedWarningActive && lastToneFrequency == 0);
 }
 ''', temp)
 

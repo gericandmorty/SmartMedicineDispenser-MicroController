@@ -82,6 +82,7 @@ Arduino GND        <──── ESP32 GND (Shared Common Ground)
 3. **5-Minute Timeout (User Misses Dose):**
    * If 5 minutes elapse without pickup confirmation:
    * Arduino shuts off buzzer relay and locks solenoid.
+   * If the drawer was opened but remains unclosed, a distinct 250 ms on / 250 ms off warning sounds for up to 30 seconds and stops when the drawer closes.
    * LCD displays:
      ```
      Line 1: DOSE MISSED :(

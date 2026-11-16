@@ -88,3 +88,7 @@ struct ServerMock {
   template<class... T> void send(T...) {}
   template<class... T> void sendHeader(T...) {}
 };
+
+int lastToneFrequency = 0;
+void tone(int, unsigned int frequency, unsigned long) { lastToneFrequency = frequency; }
+void noTone(int) { lastToneFrequency = 0; }

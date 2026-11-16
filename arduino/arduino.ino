@@ -33,6 +33,7 @@
 //    2. 5-Minute Buzzer Cutoff:
 //       - Buzzer beeps (1s ON / 1s OFF) for 5 minutes max, then silences.
 //       - The alert and countdown end with the five-minute buzzer window.
+//       - A drawer left open warns until both reed switches confirm closure.
 //    3. Magnetic Reed Switch & LED Behavior:
 //       - Drawer 1 Reed Switch (Pin 2) controls ESP1 LEDs (Drawer 1 Matrix).
 //       - Drawer 2 Reed Switch (Pin 3) controls ESP2 LEDs (Drawer 2 Matrix).
@@ -136,6 +137,29 @@ bool buzzerMutedByDrawer = false; // Keep it silent after an alerting drawer ope
 unsigned long lastBuzzerToggle = 0;
 const unsigned long BUZZER_BEEP_MS  = 1000; // 1s BEEP
 const unsigned long BUZZER_PAUSE_MS = 1000; // 1s PAUSE
+// Cabinet warning has no timeout: only both closed reeds can clear it.
+bool cabinetCloseRequired = false;
+// Passive piezo/transistor driver ONLY. Never connect a mechanical relay to this pin.
+const int MELODY_BUZZER_PIN = 6;
+const unsigned int birthdayNotes[] = {262,262,294,262,349,330,262,262,294,262,392,349,262,262,523,440,349,330,294,466,466,440,349,392,349};
+const unsigned char birthdayBeats[] = {1,1,2,2,2,4,1,1,2,2,2,4,1,1,2,2,2,2,4,1,1,2,2,2,4};
+int birthdayNote = -1;
+unsigned long birthdayNoteStart = 0;
+const unsigned long UNCLOSED_WARNING_BEEP_MS = 250;
+const unsigned long UNCLOSED_WARNING_PAUSE_MS = 250;
+const unsigned long MISSED_WARNING_MS = 30UL * 1000UL;
+const unsigned long MISSED_WARNING_BEEP_MS = 250;
+const unsigned long MISSED_WARNING_PAUSE_MS = 250;
+bool missedWarningActive = false;
+bool unresolvedMissedDose = false;
+unsigned long missedWarningStart = 0;
+int missedWarningDrawer = 0; // Zero means a closed-drawer missed dose.
+bool unclosedDrawerTracking[2] = {false, false};
+unsigned long unclosedDrawerDoseStart[2] = {0, 0};
+bool unclosedWarningActive = false;
+int unclosedWarningDrawer = 0;
+unsigned long unclosedWarningStart = 0;
+bool unclosedWarningOn = false;
 // Three quick 100ms chirps when a drawer's due medicine is collected.
 const unsigned long COMPLETION_CHIRP_MS = 100;
 const unsigned long COMPLETION_PATTERN_MS = 600;
@@ -558,12 +582,8 @@ void startAlert(const String& rawComp, int drawerNum = 1) {
   buzzerStartTime = alertStartTime;
   completionChimeActive = false;
   buzzerMutedByDrawer = false;
-  for (int i = 0; i < count; i++) {
-    if ((drawers[i] == 2 && drawer2IsOpen) || (drawers[i] == 1 && drawer1IsOpen)) {
-      buzzerMutedByDrawer = true;
-    }
-  }
-  buzzerState = !buzzerMutedByDrawer;
+  // A missed medicine suppresses all subsequent dose buzzer alerts until acknowledged.
+  buzzerState = !buzzerMutedByDrawer && !unresolvedMissedDose;
   writeRelayQuietly(BUZZER_RELAY_PIN, buzzerState ? RELAY_ON : RELAY_OFF);
   lastBuzzerToggle = alertStartTime;
   currentDisplayIdx = 0;
@@ -573,8 +593,16 @@ void startAlert(const String& rawComp, int drawerNum = 1) {
   for (int i = 0; i < count; i++) {
     unlockDrawer(drawers[i]);
     notifyCompartmentLED(labels[i], drawers[i], true);
+    int index = drawers[i] - 1;
+    if (index >= 0 && index < 2 &&
+        ((drawers[i] == 1 && drawer1IsOpen) || (drawers[i] == 2 && drawer2IsOpen)) &&
+        !unclosedDrawerTracking[index]) {
+      unclosedDrawerTracking[index] = true;
+      unclosedDrawerDoseStart[index] = alertStartTime;
+    }
   }
-  notifyESP32Vibrate(true);
+  notifyESP32Vibrate(!unresolvedMissedDose);
+  if (unresolvedMissedDose) updateDisplay("MEDICINE NOT", "TAKEN - CHECK APP");
   Serial.println("[ARDUINO] Current dose: " + token + "; buzzer: 5 minutes; countdown: 5 minutes.");
 }
 
@@ -605,12 +633,14 @@ void resolveDoseTaken(int drawerNum) {
 
   if (takenFromThisDrawer == 0) return;
 
+  if (drawer1IsOpen || drawer2IsOpen) cabinetCloseRequired = true;
+
   // Each drawer gets one distinct completion sound, including when the other
   // drawer still has medicine due. The relay controls cadence, not pitch.
-  completionChimeActive = true;
+  completionChimeActive = !cabinetCloseRequired && !unresolvedMissedDose;
   completionChimeStart = millis();
-  buzzerState = true;
-  writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_ON);
+  buzzerState = completionChimeActive;
+  writeRelayQuietly(BUZZER_RELAY_PIN, completionChimeActive ? RELAY_ON : RELAY_OFF);
 
   // Relock this drawer's solenoid relay after 3s delay (so user can close drawer)
   if (drawerNum == 1 || drawerNum == 0) {
@@ -641,7 +671,8 @@ void resolveDoseTaken(int drawerNum) {
     // Silence ESP32 vibration
     notifyESP32Vibrate(false);
 
-    updateDisplay("DOSE TAKEN! :)", takenSummary.length() > 0 ? (takenSummary + " OK") : "Drawer Closed");
+    updateDisplay(unresolvedMissedDose ? "MEDICINE NOT" : "ALL MEDS TAKEN!",
+                  unresolvedMissedDose ? "TAKEN - CHECK APP" : "Great job!");
     scheduleIdleScreen(4000);
     alertCount = 0;
 
@@ -664,6 +695,19 @@ void resolveDoseTaken(int drawerNum) {
 
 // ── Resolve Dose: MISSED (5-Minute Timeout Exceeded) ─────────────────────────
 void resolveDoseMissed() {
+  bool cutoffReached = millis() - alertStartTime >= GRACE_PERIOD_MS;
+  bool hasUntakenDose = false;
+  int openMissedDrawer = 0;
+  for (int i = 0; i < alertCount; i++) {
+    if (!activeAlerts[i].taken) {
+      hasUntakenDose = true;
+      if ((activeAlerts[i].drawer == 1 && drawer1IsOpen) ||
+          (activeAlerts[i].drawer == 2 && drawer2IsOpen))
+        openMissedDrawer = activeAlerts[i].drawer;
+      if (cutoffReached && activeAlerts[i].drawer >= 1 && activeAlerts[i].drawer <= 2)
+        unclosedDrawerTracking[activeAlerts[i].drawer - 1] = false;
+    }
+  }
   clearCurrentCompartmentLEDs();
   isAlertActive = false;
 
@@ -673,6 +717,7 @@ void resolveDoseMissed() {
   buzzerState = false;
   buzzerMutedByDrawer = false;
   completionChimeActive = false;
+  if (hasUntakenDose) unresolvedMissedDose = true;
 
   // Silence ESP32 vibration
   notifyESP32Vibrate(false);
@@ -687,7 +732,7 @@ void resolveDoseMissed() {
     }
   }
 
-  updateDisplay("DOSE MISSED :(", missedList.length() > 0 ? missedList : "Timeout");
+  updateDisplay("MEDICINE NOT", "TAKEN: " + (missedList.length() > 0 ? missedList : "Check app"));
   scheduleIdleScreen(5000);
   alertCount = 0;
 
@@ -849,7 +894,15 @@ void checkMagneticReedSwitches() {
       if (drawer1IsOpen) {
         Serial.println("[REED] Drawer 1 OPENED (Magnet Apart) -> Notifying ESP1 to turn ON LEDs!");
         notifyDrawerDoor(1, true);
-        if (isAlertActive && activeAlerts[0].drawer == 1) {
+        bool drawerHasDose = false;
+        for (int i = 0; i < alertCount; i++)
+          if (!activeAlerts[i].taken && activeAlerts[i].drawer == 1) drawerHasDose = true;
+        if (isAlertActive && drawerHasDose) {
+          cabinetCloseRequired = true;
+          if (!unclosedDrawerTracking[0]) {
+            unclosedDrawerTracking[0] = true;
+            unclosedDrawerDoseStart[0] = alertStartTime;
+          }
           // Patient opened drawer during alert: silence buzzer for retrieval
           buzzerState = false;
           buzzerMutedByDrawer = true;
@@ -857,6 +910,11 @@ void checkMagneticReedSwitches() {
           updateDisplay("DRAWER 1 OPEN", "Retrieve Dose :)");
         }
       } else {
+        unclosedDrawerTracking[0] = false;
+        if (missedWarningActive && missedWarningDrawer == 1) {
+          missedWarningActive = false;
+          writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
+        }
         Serial.println("[REED] Drawer 1 CLOSED (Magnet Put) -> Notifying ESP1 to turn OFF LEDs!");
         notifyDrawerDoor(1, false);
         lockDrawer(1); // Relock solenoid immediately when drawer is closed
@@ -883,13 +941,26 @@ void checkMagneticReedSwitches() {
       if (drawer2IsOpen) {
         Serial.println("[REED] Drawer 2 OPENED (Magnet Apart) -> Notifying ESP2 to turn ON LEDs!");
         notifyDrawerDoor(2, true);
-        if (isAlertActive && activeAlerts[0].drawer == 2) {
+        bool drawerHasDose = false;
+        for (int i = 0; i < alertCount; i++)
+          if (!activeAlerts[i].taken && activeAlerts[i].drawer == 2) drawerHasDose = true;
+        if (isAlertActive && drawerHasDose) {
+          cabinetCloseRequired = true;
+          if (!unclosedDrawerTracking[1]) {
+            unclosedDrawerTracking[1] = true;
+            unclosedDrawerDoseStart[1] = alertStartTime;
+          }
           buzzerState = false;
           buzzerMutedByDrawer = true;
           writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
           updateDisplay("DRAWER 2 OPEN", "Retrieve Dose :)");
         }
       } else {
+        unclosedDrawerTracking[1] = false;
+        if (missedWarningActive && missedWarningDrawer == 2) {
+          missedWarningActive = false;
+          writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
+        }
         Serial.println("[REED] Drawer 2 CLOSED (Magnet Put) -> Notifying ESP2 to turn OFF LEDs!");
         notifyDrawerDoor(2, false);
         lockDrawer(2); // Relock solenoid immediately when drawer is closed
@@ -948,6 +1019,10 @@ void processSerialCommand(const String& cmd) {
   }
   else if (cmd.startsWith("MISSED")) {
     resolveDoseMissed();
+  }
+  else if (cmd == "ACK_MISSED") {
+    unresolvedMissedDose = false;
+    updateDisplay("MISSED REVIEWED", "Ready for alarms");
   }
   else if (cmd == "STOP" || cmd == "SILENCE" || cmd == "CLEAR") {
     clearCurrentCompartmentLEDs();
@@ -1054,6 +1129,47 @@ String getQueryParam(const String& req, const String& param) {
   return req.substring(start, end);
 }
 
+// Both reeds must remain LOW through debounce; raw HIGH must never clear a warning.
+bool cabinetFullyClosed() {
+  return !drawer1IsOpen && !drawer2IsOpen &&
+    digitalRead(REED_SWITCH_DRAWER1) == LOW && digitalRead(REED_SWITCH_DRAWER2) == LOW &&
+    millis() - lastDebounceTime1 > DEBOUNCE_DELAY_MS &&
+    millis() - lastDebounceTime2 > DEBOUNCE_DELAY_MS;
+}
+
+void updateCabinetWarning() {
+  if (cabinetCloseRequired && cabinetFullyClosed()) cabinetCloseRequired = false;
+  if (!cabinetCloseRequired) {
+    if (unclosedWarningActive) {
+      writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
+      noTone(MELODY_BUZZER_PIN);
+      birthdayNote = -1;
+      unclosedWarningActive = false;
+      unclosedWarningOn = false;
+      buzzerState = false;
+      lastBuzzerToggle = millis();
+    }
+    return;
+  }
+  if (!unclosedWarningActive) {
+    unclosedWarningStart = millis();
+    unclosedWarningActive = true;
+    birthdayNote = -1;
+  }
+  unclosedWarningDrawer = drawer1IsOpen ? 1 : 2;
+  completionChimeActive = false;
+  updateDisplay("CLOSE CABINET", "Close both doors");
+  unsigned long cycle = UNCLOSED_WARNING_BEEP_MS + UNCLOSED_WARNING_PAUSE_MS;
+  unclosedWarningOn = (millis() - unclosedWarningStart) % cycle < UNCLOSED_WARNING_BEEP_MS;
+  writeRelayQuietly(BUZZER_RELAY_PIN, unclosedWarningOn ? RELAY_ON : RELAY_OFF);
+  // Nonblocking Happy Birthday, repeated until the cabinet is properly closed.
+  if (birthdayNote < 0 || millis() - birthdayNoteStart >= birthdayBeats[birthdayNote] * 200UL) {
+    birthdayNote = (birthdayNote + 1) % (sizeof(birthdayNotes) / sizeof(birthdayNotes[0]));
+    birthdayNoteStart = millis();
+    tone(MELODY_BUZZER_PIN, birthdayNotes[birthdayNote], birthdayBeats[birthdayNote] * 180UL);
+  }
+}
+
 // ── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
@@ -1062,6 +1178,8 @@ void setup() {
   // 1. Initialize Buzzer Relay Pin (GPIO 7 - Active-LOW)
   writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
   pinMode(BUZZER_RELAY_PIN, OUTPUT);
+  pinMode(MELODY_BUZZER_PIN, OUTPUT);
+  noTone(MELODY_BUZZER_PIN);
 
   // 2. Initialize Dual Solenoid Relay Pins (Pin 8 for Drawer 1, Pin 9 for Drawer 2 - Active-LOW)
   writeRelayQuietly(SOLENOID_DRAWER1_PIN, SOLENOID_OFF);
@@ -1214,9 +1332,11 @@ void loop() {
       unsigned long now = millis();
 
       // B. Buzzer Beeps ONLY for the first 5 minutes (300,000 ms)
-      if (completionChimeActive) {
+      if (unclosedWarningActive) {
+        // The distinct open-drawer warning owns the buzzer until both doors close.
+      } else if (completionChimeActive) {
         // The distinct completion chirp has priority over the due-dose cadence.
-      } else if (!buzzerMutedByDrawer && (now - buzzerStartTime) < BUZZER_DURATION_MS) {
+      } else if (!unresolvedMissedDose && !buzzerMutedByDrawer && (now - buzzerStartTime) < BUZZER_DURATION_MS) {
         if (buzzerState && (now - lastBuzzerToggle >= BUZZER_BEEP_MS)) {
           buzzerState = false;
           writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
@@ -1359,6 +1479,15 @@ void loop() {
     buzzerPulseActive = false;
     writeRelayQuietly(BUZZER_RELAY_PIN, RELAY_OFF);
   }
+
+  // Highest priority buzzer owner, after all timed alarms/manual pulses.
+  // A pending pickup also warns at its deadline if opened before this firmware loop.
+  for (int i = 0; i < 2; i++) {
+    if (unclosedDrawerTracking[i] && (i == 0 ? drawer1IsOpen : drawer2IsOpen) &&
+        millis() - unclosedDrawerDoseStart[i] >= GRACE_PERIOD_MS) cabinetCloseRequired = true;
+  }
+  updateCabinetWarning();
+
 
   // 6. LCD Auto-Reset to Idle Screen
   if (!isAlertActive && lcdNeedsReset && millis() >= lcdResetTime) {
@@ -1674,8 +1803,23 @@ void loop() {
 
       resolveDoseTaken(0); // Resolve all drawers
     }
+    else if (req.indexOf("/ack-missed") != -1) {
+      unresolvedMissedDose = false;
+      client.println("HTTP/1.1 200 OK");
+      client.println("Content-Type: application/json");
+      client.println("Connection: close");
+      client.println("Access-Control-Allow-Origin: *");
+      client.println();
+      client.println("{\"status\":\"ok\"}");
+      delay(10);
+      client.stop();
+    }
     else if (req.indexOf("/status") != -1 || req.indexOf("/ping") != -1) {
       String json = "{\"status\":\"online\",\"device\":\"Arduino-Controller\",\"is_alerting\":" + String(isAlertActive ? "true" : "false") + ",\"active_alerts\":" + String(alertCount) + ",\"schedules\":" + String(scheduleCount) + ",\"last_dose_taken\":" + String(lastDoseTaken ? "true" : "false") + ",\"last_taken_ms_ago\":" + String(lastDoseTaken ? (millis() - lastDoseTakenMillis) : 999999) + ",\"last_taken_comp\":\"" + lastTakenSummary + "\"";
+      json += ",\"unresolved_missed_dose\":" + String(unresolvedMissedDose ? "true" : "false");
+      json += ",\"drawer1_open\":" + String((drawer1IsOpen || digitalRead(REED_SWITCH_DRAWER1) == HIGH) ? "true" : "false");
+      json += ",\"drawer2_open\":" + String((drawer2IsOpen || digitalRead(REED_SWITCH_DRAWER2) == HIGH) ? "true" : "false");
+      json += ",\"cabinet_close_required\":" + String(cabinetCloseRequired ? "true" : "false");
       json += ",\"esp32_ip\":\"" + (esp32IP != INADDR_NONE ? esp32IP.toString() : "") + "\"";
       json += ",\"esp1_ip\":\"" + (esp1IP != INADDR_NONE ? esp1IP.toString() : "") + "\"";
       json += ",\"esp2_ip\":\"" + (esp2IP != INADDR_NONE ? esp2IP.toString() : "") + "\"}";
