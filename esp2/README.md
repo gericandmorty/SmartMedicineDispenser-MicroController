@@ -22,7 +22,7 @@ Drawer 2 consists of a 7-column by 3-row grid (**21 total compartments**):
 
 The sketch uses discrete compartment LEDs. Saved schedules stay dark. Only the
 currently due compartment blinks while its drawer is open; a new due compartment
-replaces the previous indication. Pickup confirmation or the 20-minute timeout
+replaces the previous indication. Pickup confirmation or the 5-minute timeout
 clears the light. Closing and reopening the drawer does not restore a collected
 dose. See [scheduling details and verification](../README.md).
 
@@ -68,7 +68,7 @@ curl "http://dispenser-drawer2.local/led?slot=0&state=active"
 # Turn slot 0 (A1) Red (Out of stock)
 curl "http://dispenser-drawer2.local/led?slot=0&state=out_of_stock"
 
-# Start flashing alert on slot 0 (A1) during 20-min countdown
+# Start flashing alert on slot 0 (A1) during 5-min countdown
 curl "http://dispenser-drawer2.local/alert?slot=0"
 
 # Clear all LEDs

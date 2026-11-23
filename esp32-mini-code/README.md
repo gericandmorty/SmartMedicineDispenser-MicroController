@@ -48,7 +48,7 @@ hotspot test are still required to verify radio and authentication behavior.
          │       ESP32 MINI MASTER CONTROLLER            │
          │  • Wi-Fi NTP Real-Time Clock & Epoch Sync     │
          │  • Non-blocking Vibration Motor Alert (GPIO 4)│
-         │  • 20-Minute Grace Period State Machine       │
+         │  • 5-Minute Grace Period State Machine        │
          │  • Event History Buffer (GET /events)         │
          │  • NVS Flash Memory (Saved Schedules)         │
          └───────────────────────┬───────────────────────┘
@@ -92,15 +92,15 @@ ESP32 GPIO 4 ───[ 1kΩ Resistor ]─── Base (NPN 2N2222)
 
 ---
 
-## ⏱️ 20-Minute Active Alert Lifecycle (Specification Verified)
+## ⏱️ 5-Minute Active Alert Lifecycle (Specification Verified)
 
 1. **Alarm Trigger (Scheduled Time Hit):**
-   * ESP32 Mini enters active alert (`is_alerting: true`, `remaining_seconds: 1200`).
+   * ESP32 Mini enters active alert (`is_alerting: true`, `remaining_seconds: 300`).
    * Vibration motor fires **3 strong pulses** (`700ms on / 300ms off`).
    * Sends HTTP trigger to **ESP1** (if Drawer 1) or **ESP2** (if Drawer 2) to flash the compartment LED amber.
    * Sends `ALERT:<compartment>` to the Arduino to display on the 16x2 LCD.
 
-2. **Periodic Reminder During 20 Minutes:**
+2. **Periodic Reminder During 5 Minutes:**
    * Every **3 minutes**, fires a 2-pulse vibration reminder if not yet taken.
 
 3. **Resolution A - Patient Takes Dose (On-Time):**
@@ -110,12 +110,16 @@ ESP32 GPIO 4 ───[ 1kΩ Resistor ]─── Base (NPN 2N2222)
    * Arduino LCD displays `"DOSE TAKEN! :)"`.
    * Logged as **`TAKEN`** with exact elapsed seconds in `GET /events`.
 
-4. **Resolution B - 20 Minutes Timeout (Missed):**
-   * If 1200 seconds elapse without intake:
+4. **Resolution B - 5 Minutes Timeout (Missed):**
+   * If 300 seconds elapse without intake:
    * Vibration stops.
    * Compartment LED clears.
    * Arduino LCD displays `"DOSE MISSED :("`.
    * Logged as **`MISSED`** in `GET /events`.
+
+If another dose becomes due before the five-minute timeout, the unconfirmed
+previous dose is logged as `MISSED` immediately. The new dose starts its own
+five-minute alarm window.
 
 ---
 
@@ -126,6 +130,8 @@ ESP32 GPIO 4 ───[ 1kΩ Resistor ]─── Base (NPN 2N2222)
 | `GET` | `/status` | Complete state with `active_alert` and countdown | `http://dispenser.local/status` |
 | `GET` | `/events` | Last 20 dose events for offline mobile sync | `http://dispenser.local/events?limit=10` |
 | `GET/POST`| `/vibrate` | Trigger custom vibration pattern | `http://dispenser.local/vibrate?duration=2500&pulses=3` |
+| `GET` | `/mute-vibration` | Silence motor only | `http://dispenser.local/mute-vibration` |
+| `GET` | `/pickup` | Confirm a matching drawer pickup | `http://dispenser.local/pickup?compartment=Drawer+1+(A1)` |
 | `GET` | `/stop-vibrate` | Stop vibration and mark dose taken | `http://dispenser.local/stop-vibrate` |
 | `GET/POST`| `/set-schedule` | Add or update schedule with RTC drift calibration | `http://dispenser.local/set-schedule?hour=8&minute=30&amPm=AM&slotIndex=0` |
 | `GET` | `/delete-schedule`| Delete schedule by ID | `http://dispenser.local/delete-schedule?id=sch_1` |

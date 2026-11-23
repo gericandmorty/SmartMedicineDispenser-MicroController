@@ -63,7 +63,7 @@ bool isDrawerOpen      = false;   // Default: CLOSED. LEDs will NOT lit if reed 
 // Non-blocking blink timing
 unsigned long lastBlinkMs = 0;
 unsigned long alertStartedMs = 0;
-const unsigned long ALERT_DURATION_MS = 20UL * 60UL * 1000UL;
+const unsigned long ALERT_DURATION_MS = 5UL * 60UL * 1000UL;
 bool blinkState = false;
 const unsigned long BLINK_INTERVAL = 350; // ms
 
