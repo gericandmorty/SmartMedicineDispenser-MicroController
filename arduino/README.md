@@ -70,8 +70,8 @@ Arduino GND        <──── ESP32 GND (Shared Common Ground)
 2. **User Takes Medicine (Drawer Opens, Then Closes):**
    * Patient opens Drawer 1.
    * Magnetic reed switch on Pin 2 triggers.
-   * Arduino **instantly silences the buzzer relay** when the alerting drawer opens. The current compartment stays indicated during retrieval; closing the drawer locks it and confirms pickup.
-   * LCD displays:
+   * Opening either drawer starts a 30-second pulsing buzzer warning. Closing both drawers ends the warning early. The current compartment stays indicated during retrieval; closing the drawer locks it and confirms pickup.
+   * When every due dose has been collected and no miss is outstanding, the buzzer pulses for 30 seconds. For a partial pickup the LCD displays:
      ```
      Line 1: DOSE TAKEN! :)
      Line 2: A1 OK
@@ -81,12 +81,7 @@ Arduino GND        <──── ESP32 GND (Shared Common Ground)
 
 3. **5-Minute Timeout (User Misses Dose):**
    * If 5 minutes elapse without pickup confirmation:
-   * Arduino shuts off buzzer relay and locks solenoid.
-   * If the drawer was opened but remains unclosed, a distinct 250 ms on / 250 ms off warning sounds for up to 30 seconds and stops when the drawer closes.
-   * LCD displays:
-     ```
-     Line 1: DOSE MISSED :(
-     Line 2: Drawer 1 (A1)
-     ```
-   * Arduino sends `MISSED:Drawer 1` to ESP32-Mini.
+   * Arduino locks the solenoid. With both drawers closed, the missed-dose buzzer pulses for 30 seconds. An open drawer keeps its original buzzer deadline.
+   * The LCD and app keep the close-door prompt visible until both doors are confirmed closed.
+   * The Arduino mutes ESP32 vibration through `/mute-vibration` and reports the missed compartment over serial.
    * Mobile app records dose as **`MISSED`**.

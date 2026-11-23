@@ -130,6 +130,8 @@ five-minute alarm window.
 | `GET` | `/status` | Complete state with `active_alert` and countdown | `http://dispenser.local/status` |
 | `GET` | `/events` | Last 20 dose events for offline mobile sync | `http://dispenser.local/events?limit=10` |
 | `GET/POST`| `/vibrate` | Trigger custom vibration pattern | `http://dispenser.local/vibrate?duration=2500&pulses=3` |
+| `GET` | `/mute-vibration` | Silence motor only | `http://dispenser.local/mute-vibration` |
+| `GET` | `/pickup` | Confirm a matching drawer pickup | `http://dispenser.local/pickup?compartment=Drawer+1+(A1)` |
 | `GET` | `/stop-vibrate` | Stop vibration and mark dose taken | `http://dispenser.local/stop-vibrate` |
 | `GET/POST`| `/set-schedule` | Add or update schedule with RTC drift calibration | `http://dispenser.local/set-schedule?hour=8&minute=30&amPm=AM&slotIndex=0` |
 | `GET` | `/delete-schedule`| Delete schedule by ID | `http://dispenser.local/delete-schedule?id=sch_1` |

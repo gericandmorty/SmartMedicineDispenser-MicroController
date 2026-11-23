@@ -175,6 +175,12 @@ void startVibrationAlert(int pulses = 1, unsigned long onMs = 60000UL, unsigned 
   Serial.printf("[VIBRATION] Started: %d pulse(s) (%lu ms on / %lu ms off) - 1 minute continuous vibration active\n", pulses, onMs, offMs);
 }
 
+// The Arduino sends the same due signal over serial and HTTP.
+void ensureDueVibration() {
+  if (isVibrating && totalPulses == 1 && pulseOnDuration == VIBRATION_ALERT_DURATION_MS) return;
+  startVibrationAlert(1, VIBRATION_ALERT_DURATION_MS, 0);
+}
+
 void stopVibration() {
   isVibrating = false;
   motorIsOn = false;
@@ -276,6 +282,19 @@ void logDoseEvent(const char* scheduleId, const char* compartment, const char* r
   Serial.printf("[EVENT LOGGED] ID: %s | %s | %s | %ds\n", eventHistory[0].eventId, compartment, resolution, elapsedSec);
 }
 
+int sendDrawerRequest(const String& url) {
+  HTTPClient http;
+  http.begin(url);
+  http.setConnectTimeout(400);
+  http.setTimeout(600);
+  int code = http.GET();
+  http.end();
+  // A bulk schedule can address 42 slots. Service local outputs between requests.
+  updateVibrationState();
+  updateDispenserState();
+  return code;
+}
+
 // ── Notify Drawer 1 (ESP1) or Drawer 2 (ESP2) LEDs over Wi-Fi ────────────────
 void notifyDrawerLED(int drawer, int slot, const String& action) {
   int col = slot % 7;
@@ -296,11 +315,7 @@ void notifyDrawerLED(int drawer, int slot, const String& action) {
   }
 
   if (targetUrl.length() > 0) {
-    HTTPClient http;
-    http.begin(targetUrl);
-    http.setTimeout(1200); // 1.2s timeout
-    int code = http.GET();
-    http.end();
+    int code = sendDrawerRequest(targetUrl);
     Serial.printf("[DRAWER HTTP] %s -> HTTP %d\n", targetUrl.c_str(), code);
   }
 }
@@ -308,7 +323,6 @@ void notifyDrawerLED(int drawer, int slot, const String& action) {
 // ── Notify ESP1 / ESP2 when Reed Switch Opens or Closes ─────────────────────
 void notifyDrawerDoorState(int drawer, bool isOpen) {
   if (WiFi.status() != WL_CONNECTED) return;
-  HTTPClient http;
   String host = "";
   if (drawer == 1) {
     host = (dynamicDrawer1Host.length() > 0) ? dynamicDrawer1Host : String(DRAWER1_HOST);
@@ -316,10 +330,7 @@ void notifyDrawerDoorState(int drawer, bool isOpen) {
     host = (dynamicDrawer2Host.length() > 0) ? dynamicDrawer2Host : String(DRAWER2_HOST);
   }
   String url = host + "/door?state=" + (isOpen ? "open" : "closed");
-  http.begin(url);
-  http.setTimeout(1200);
-  int code = http.GET();
-  http.end();
+  int code = sendDrawerRequest(url);
   Serial.printf("[DOOR HTTP] Drawer %d -> %s (HTTP %d)\n", drawer, isOpen ? "OPEN (LEDs ON)" : "CLOSED (LEDs OFF)", code);
 }
 
@@ -382,19 +393,23 @@ void notifyArduinoAlert(const String& compartment, int drawer = 1) {
     String host = (dynamicArduinoHost.length() > 0) ? dynamicArduinoHost : String(ARDUINO_HOST);
     String url = host + "/alert?compartment=" + encComp + "&drawer=" + String(drawer);
     http.begin(url);
-    http.setTimeout(1500);
+    http.setConnectTimeout(500);
+    http.setTimeout(1000);
     http.GET();
     http.end();
   }
 }
 
 void notifyArduinoStop() {
-  Serial.println("STOP");
+  Serial.printf("CONFIRM_ALL:%s\n", currentAlert.compartment);
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
     String host = (dynamicArduinoHost.length() > 0) ? dynamicArduinoHost : String(ARDUINO_HOST);
-    http.begin(host + "/stop-vibrate");
-    http.setTimeout(1500);
+    String comp = currentAlert.compartment;
+    comp.replace(" ", "+");
+    http.begin(host + "/confirm?compartment=" + comp);
+    http.setConnectTimeout(500);
+    http.setTimeout(1000);
     http.GET();
     http.end();
   }
@@ -632,6 +647,17 @@ void checkAlarms() {
         lastTriggeredHour = currentHour;
         lastTriggeredDay = currentDay;
 
+        schedules[i].lastTriggeredDate = currentDay;
+        String prefix = "s" + String(i) + "_";
+        preferences.begin("dispenser", false);
+        preferences.putULong((prefix + "fired").c_str(), currentDay);
+        if (schedules[i].date[0]) {
+          schedules[i].active = false;
+          preferences.putBool((prefix + "a").c_str(), false);
+        }
+        preferences.end();
+        if (!extendGroup) startVibrationAlert(1, 60000UL, 0);
+
         // Clear the previous indication, including when it was in the other
         // drawer. A later due time ends the unconfirmed dose as MISSED.
         if (currentAlert.isAlerting && !extendGroup) {
@@ -649,11 +675,6 @@ void checkAlarms() {
             notifyDrawerLED(previousDrawer, currentAlert.slotIndex, "clear-alert");
           }
         }
-        // Persist before notifying hardware so a reboot cannot replay this dose.
-        schedules[i].lastTriggeredDate = currentDay;
-        if (strlen(schedules[i].date) > 0) schedules[i].active = false;
-        saveSchedulesToNVS();
-
         // Parse slots for this schedule (bulk or single)
         int alertSlots[MAX_BULK_SLOTS];
         int alertCount = parseCompartmentSlots(schedules[i].compartment, schedules[i].slots, schedules[i].slotIndex, alertSlots, MAX_BULK_SLOTS);
@@ -676,11 +697,10 @@ void checkAlarms() {
               currentAlert.alertSlots[currentAlert.alertSlotCount++] = alertSlots[s];
           }
           currentAlert.relayNum = (alertSlots[0] >= 21) ? 3 : 1;
-          currentAlert.alertStartEpoch = getCurrentEpoch();
-          currentAlert.lastReminderVibrateMs = millis();
-
-          // 2. Start strong continuous vibration for alert (60 seconds)
-          startVibrationAlert(1, 60000UL, 0);
+          if (!extendGroup) {
+            currentAlert.alertStartEpoch = getCurrentEpoch();
+            currentAlert.lastReminderVibrateMs = millis();
+          }
         }
 
         // 3. Trigger compartment LED on ESP1 (Drawer 1) or ESP2 (Drawer 2) for each scheduled item
@@ -698,9 +718,6 @@ void checkAlarms() {
         if (hasDrawer1) triggerDispenseRelay(1);
         if (hasDrawer2) triggerDispenseRelay(3);
 
-
-        // Reset timer so blocking HTTP calls to ESP1/ESP2 & Arduino do NOT consume vibration duration!
-        vibrationStateTimer = millis();
 
       }
     }
@@ -785,36 +802,48 @@ void handleEvents() {
   server.send(200, "application/json", json);
 }
 
-// GET /stop-vibrate or POST /dispense-confirm (Confirm dose taken & silence alarm)
-void handleStopVibrate() {
+// Muting the motor after a timeout or during a later alarm carries no dose result.
+void handleMuteVibration() {
   sendCORSHeaders();
   stopVibration();
+  server.send(200, "application/json", "{\"status\":\"ok\"}");
+}
 
-  if (currentAlert.isAlerting) {
-    time_t now = getCurrentEpoch();
-    int elapsed = (int)(now - currentAlert.alertStartEpoch);
+bool confirmCurrentPickup(bool notifyArduino) {
+  if (!currentAlert.isAlerting) return false;
+  int elapsed = (int)(getCurrentEpoch() - currentAlert.alertStartEpoch);
+  if (elapsed >= GRACE_PERIOD_SECONDS) return false;
+  stopVibration();
+  logDoseEvent(currentAlert.scheduleId, currentAlert.compartment, "TAKEN", elapsed);
+  currentAlert.isAlerting = false;
+  for (int s = 0; s < currentAlert.alertSlotCount; s++) {
+    int slot = currentAlert.alertSlots[s];
+    notifyDrawerLED(slot >= 21 ? 2 : 1, slot, "clear-alert");
+  }
+  if (currentAlert.alertSlotCount == 0) {
+    int slot = currentAlert.slotIndex;
+    notifyDrawerLED(slot >= 21 ? 2 : 1, slot, "clear-alert");
+  }
+  if (notifyArduino) notifyArduinoStop();
+  return true;
+}
 
-    logDoseEvent(currentAlert.scheduleId, currentAlert.compartment, "TAKEN", elapsed);
-
-    // Turn off alerting LED for all slots
-    for (int s = 0; s < currentAlert.alertSlotCount; s++) {
-      int slot = currentAlert.alertSlots[s];
-      int drawer = (slot >= 21) ? 2 : 1;
-      notifyDrawerLED(drawer, slot, "clear-alert");
-    }
-    if (currentAlert.alertSlotCount == 0) {
-      int drawer = (currentAlert.slotIndex >= 21) ? 2 : 1;
-      notifyDrawerLED(drawer, currentAlert.slotIndex, "clear-alert");
-    }
-
-    // Signal Arduino over Serial & Wi-Fi
-    notifyArduinoStop();
-
-    currentAlert.isAlerting = false;
+// Existing app and dashboard confirmation endpoint.
+void handleStopVibrate() {
+  sendCORSHeaders();
+  int elapsed = (int)(getCurrentEpoch() - currentAlert.alertStartEpoch);
+  if (confirmCurrentPickup(true)) {
     server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"stopped\",\"marked_status\":\"TAKEN\",\"elapsed_seconds\":" + String(elapsed) + "}");
   } else {
+    stopVibration();
     server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"stopped\"}");
   }
+}
+
+void handlePickupReport() {
+  sendCORSHeaders();
+  if (server.arg("compartment") == String(currentAlert.compartment)) confirmCurrentPickup(false);
+  server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 
 // GET/POST /vibrate
@@ -830,7 +859,8 @@ void handleVibrate() {
   if (pulses > 1 && onMs > 1000) onMs = 700;
   unsigned long offMs = (pulses > 1) ? 250 : 0;
 
-  startVibrationAlert(pulses, onMs, offMs);
+  if (pulses == 1 && onMs == VIBRATION_ALERT_DURATION_MS) ensureDueVibration();
+  else startVibrationAlert(pulses, onMs, offMs);
   server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"vibrating\",\"pulses\":" + String(pulses) + ",\"duration\":" + String(duration) + "}");
 }
 
@@ -869,31 +899,32 @@ void handleAlert() {
   bool duplicate = currentAlert.isAlerting && currentAlert.alertSlotCount == count &&
                    comp == String(currentAlert.compartment);
   for (int i = 0; i < count && duplicate; i++) duplicate = currentAlert.alertSlots[i] == slots[i];
-  if (!duplicate) {
-    if (currentAlert.isAlerting) {
-      for (int i = 0; i < currentAlert.alertSlotCount; i++) {
-        int previous = currentAlert.alertSlots[i];
-        notifyDrawerLED(previous >= 21 ? 2 : 1, previous, "clear-alert");
-      }
-    }
-    currentAlert.isAlerting = true;
-    strncpy(currentAlert.scheduleId, "remote_alert", sizeof(currentAlert.scheduleId));
-    snprintf(currentAlert.compartment, sizeof(currentAlert.compartment), "%s", comp.c_str());
-    currentAlert.slotIndex = slots[0];
-    currentAlert.alertSlotCount = count;
-    for (int i = 0; i < count; i++) {
-      currentAlert.alertSlots[i] = slots[i];
-      notifyDrawerLED(slots[i] >= 21 ? 2 : 1, slots[i], "alert");
-    }
-    currentAlert.relayNum = (drw == 2) ? 3 : 1;
-    currentAlert.alertStartEpoch = getCurrentEpoch();
-    currentAlert.lastReminderVibrateMs = millis();
+  if (duplicate) {
+    server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"already_alerting\"}");
+    return;
   }
-
-  // Start continuous 1-minute vibration alert
   startVibrationAlert(1, 60000UL, 0);
-  Serial.printf("[ALERT] Hardware alert received for %s (Drawer %d) -> Vibration active (60s)\n", comp.c_str(), drw);
+  // Acknowledge the local motor before contacting any drawer over the network.
   server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"alert_started\",\"drawer\":" + String(drw) + ",\"vibrating\":true}");
+  time_t started = getCurrentEpoch();
+  if (currentAlert.isAlerting) {
+    for (int i = 0; i < currentAlert.alertSlotCount; i++) {
+      int previous = currentAlert.alertSlots[i];
+      notifyDrawerLED(previous >= 21 ? 2 : 1, previous, "clear-alert");
+    }
+  }
+  currentAlert.isAlerting = true;
+  strncpy(currentAlert.scheduleId, "remote_alert", sizeof(currentAlert.scheduleId));
+  snprintf(currentAlert.compartment, sizeof(currentAlert.compartment), "%s", comp.c_str());
+  currentAlert.slotIndex = slots[0];
+  currentAlert.alertSlotCount = count;
+  currentAlert.relayNum = (drw == 2) ? 3 : 1;
+  currentAlert.alertStartEpoch = started;
+  currentAlert.lastReminderVibrateMs = millis();
+  for (int i = 0; i < count; i++) {
+    currentAlert.alertSlots[i] = slots[i];
+    notifyDrawerLED(slots[i] >= 21 ? 2 : 1, slots[i], "alert");
+  }
 }
 
 // GET/POST /solenoid?drawer=1&state=unlock (or lock)
@@ -913,7 +944,7 @@ void handleSolenoid() {
       if (RELAY3_PIN >= 0) digitalWrite(RELAY3_PIN, RELAY_ON);
       if (RELAY4_PIN >= 0) digitalWrite(RELAY4_PIN, RELAY_ON);
     }
-    Serial.printf("SOLENOID:%d UNLOCK\n", drw);
+    Serial.printf("SOLENOID:%d UNLOCK%s\n", drw, server.arg("restock") == "1" ? " RESTOCK" : "");
     Serial.printf("[ESP32] Solenoid Drawer %d UNLOCKED\n", drw);
   } else {
     if (drw == 1 || drw == 0) {
@@ -978,9 +1009,9 @@ void handleSetSchedule() {
   if (success) {
     // Save schedule metadata; the drawer stays dark until /alert arrives.
     int drawer = (slotIndex >= 21) ? 2 : 1;
-    notifyDrawerLED(drawer, slotIndex, "led?state=active");
     String resp = "{\"status\":\"ok\",\"message\":\"Schedule saved\",\"id\":\"" + id + "\",\"rtc_calibrated\":" + String(rtcCalibrated ? "true" : "false") + "}";
     server.send(200, "application/json", resp);
+    notifyDrawerLED(drawer, slotIndex, "led?state=active");
   } else {
     server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Failed to save schedule\"}");
   }
@@ -1207,43 +1238,50 @@ void handleRoot() {
   server.send(200, "text/html", html);
 }
 
-// Event callbacks run on the Wi-Fi task: only log here; manage services in loop().
+bool wifiServicesReady = false;
+bool wifiDisconnectReported = false; // Shared with the Wi-Fi event task.
+unsigned long lastWiFiAttempt = 0;
+const unsigned long WIFI_FAILURE_RETRY_MS = 3000;
+const unsigned long WIFI_RETRY_MS = 30000; // Watchdog for an attempt with no result.
+
 void logWiFiDisconnect(WiFiEvent_t event, WiFiEventInfo_t info) {
+  __atomic_store_n(&wifiDisconnectReported, true, __ATOMIC_RELEASE);
   Serial.printf("[WIFI] Disconnected: reason=%u (ESP-IDF reason code)\n",
                 unsigned(info.wifi_sta_disconnected.reason));
 }
 
-bool wifiServicesReady = false;
-unsigned long lastWiFiAttempt = 0;
-const unsigned long WIFI_RETRY_MS = 30000;
-
 void maintainWiFi() {
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!wifiServicesReady) {
-      String ip = WiFi.localIP().toString();
-      Serial.printf("[WIFI] Connected! IP Address: %s\n", ip.c_str());
-      Serial.printf("IP:%s\n", ip.c_str());
-      if (MDNS.begin("dispenser")) {
-        Serial.println("[MDNS] Started: http://dispenser.local");
-      }
-      udpDiscovery.begin(UDP_DISCOVERY_PORT);
-      configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2);
-      wifiServicesReady = true;
-    }
-    return;
-  }
-
-  if (wifiServicesReady) {
+  static unsigned long retryDelay = WIFI_RETRY_MS;
+  bool disconnected = __atomic_exchange_n(&wifiDisconnectReported, false, __ATOMIC_ACQUIRE);
+  bool connected = WiFi.status() == WL_CONNECTED;
+  if (wifiServicesReady && (!connected || disconnected)) {
     udpDiscovery.stop();
     MDNS.end();
-    // A hotspot can assign different addresses after restarting.
     dynamicArduinoHost = "";
     dynamicDrawer1Host = "";
     dynamicDrawer2Host = "";
     wifiServicesReady = false;
     lastWiFiAttempt = millis();
   }
-  if (millis() - lastWiFiAttempt >= WIFI_RETRY_MS) {
+  if (connected) {
+    retryDelay = WIFI_RETRY_MS;
+    if (!wifiServicesReady) {
+      String ip = WiFi.localIP().toString();
+      Serial.printf("[WIFI] Connected! IP Address: %s\n", ip.c_str());
+      Serial.printf("IP:%s\n", ip.c_str());
+      if (MDNS.begin("dispenser")) Serial.println("[MDNS] Started: http://dispenser.local");
+      udpDiscovery.begin(UDP_DISCOVERY_PORT);
+      configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2);
+      wifiServicesReady = true;
+    }
+    return;
+  }
+  if (disconnected) {
+    lastWiFiAttempt = millis();
+    retryDelay = WIFI_FAILURE_RETRY_MS;
+  }
+  if (millis() - lastWiFiAttempt >= retryDelay) {
+    retryDelay = WIFI_RETRY_MS;
     lastWiFiAttempt = millis();
     Serial.printf("[WIFI] Retrying '%s'; status=%d\n", ssid, int(WiFi.status()));
     WiFi.reconnect();
@@ -1253,11 +1291,6 @@ void maintainWiFi() {
 // ── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  unsigned long serialWait = millis();
-  while (!Serial && (millis() - serialWait < 2500)) {
-    delay(50);
-  }
-  delay(500);
   Serial.println("\n========================================================");
   Serial.println("  SMART MEDICINE DISPENSER - ESP32 MASTER CONTROLLER");
   Serial.println("========================================================");
@@ -1278,31 +1311,19 @@ void setup() {
   if (RELAY3_PIN >= 0) { pinMode(RELAY3_PIN, OUTPUT); digitalWrite(RELAY3_PIN, RELAY_OFF); }
   if (RELAY4_PIN >= 0) { pinMode(RELAY4_PIN, OUTPUT); digitalWrite(RELAY4_PIN, RELAY_OFF); }
 
-  loadSchedulesFromNVS();
-
-  // Quick initial vibration self-test (100ms)
-  startVibrationAlert(1, 100, 50);
-
   // Start Wi-Fi in pure Station Mode (Direct connection to router, No Hotspot)
   WiFi.onEvent(logWiFiDisconnect, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
+  WiFi.setAutoReconnect(false);
   WiFi.setSleep(false);
   lastWiFiAttempt = millis();
   WiFi.begin(ssid, password);
   Serial.printf("\n[WIFI] Connecting directly to '%s'...\n", ssid);
 
-  int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 40) {
-    delay(500);
-    Serial.print(".");
-    retries++;
-  }
+  loadSchedulesFromNVS();
 
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.printf("\n[WIFI] Not connected to '%s'; status=%d. Retrying every 30s.\n",
-                  ssid, int(WiFi.status()));
-  }
+  // Quick initial vibration self-test (100ms)
+  startVibrationAlert(1, 100, 50);
 
   // Setup Web Server Endpoints
   server.on("/", HTTP_GET, handleRoot);
@@ -1313,6 +1334,8 @@ void setup() {
   server.on("/alert", HTTP_POST, handleAlert);
   server.on("/vibrate", HTTP_GET, handleVibrate);
   server.on("/vibrate", HTTP_POST, handleVibrate);
+  server.on("/mute-vibration", HTTP_GET, handleMuteVibration);
+  server.on("/pickup", HTTP_GET, handlePickupReport);
   server.on("/stop-vibrate", HTTP_GET, handleStopVibrate);
   server.on("/dispense-confirm", HTTP_POST, handleStopVibrate);
   server.on("/dispense", HTTP_GET, handleDispense);
@@ -1343,14 +1366,28 @@ void setup() {
 
 // ── Handle Serial Messages from Arduino or Serial Monitor ───────────────────
 void handleSerialFromArduino() {
-  if (Serial.available() > 0) {
-    String msg = Serial.readStringUntil('\n');
+  static char line[256];
+  static size_t length = 0;
+  while (Serial.available() > 0) {
+    int ch = Serial.read();
+    if (ch < 0) return;
+    if (ch != '\n') {
+      if (length < sizeof(line)) line[length++] = (char)ch;
+      continue;
+    }
+    if (length == sizeof(line)) {
+      length = 0;
+      continue;
+    }
+    line[length] = '\0';
+    String msg(line);
+    length = 0;
     msg.trim();
-    if (msg.startsWith("TAKEN:")) {
-      String comp = msg.substring(6);
+    if (msg.startsWith("TAKEN:") || msg.startsWith("COLLECTED:")) {
+      String comp = msg.substring(msg.indexOf(':') + 1);
       Serial.printf("[SERIAL <- ARDUINO] Magnetic Reed Switch Triggered! Dose TAKEN for: %s\n", comp.c_str());
       // A delayed pickup for an older compartment must not clear the new dose.
-      if (currentAlert.isAlerting && comp == String(currentAlert.compartment)) handleStopVibrate();
+      if (currentAlert.isAlerting && comp == String(currentAlert.compartment)) confirmCurrentPickup(false);
     } else if (msg.startsWith("LED:")) {
       // Forward direct Arduino schedule/clear events to the correct drawer.
       int secondColon = msg.indexOf(':', 4);
@@ -1392,23 +1429,23 @@ void handleSerialFromArduino() {
       Serial.printf("  Schedules     : %d active in memory\n", scheduleCount);
       Serial.println("================================================\n");
     } else if (msg.equalsIgnoreCase("VIBRATE")) {
-      Serial.println("[TEST] Triggering 3 vibration pulses on GPIO 4...");
-      startVibrationAlert(3, 600, 300);
+      ensureDueVibration();
     } else if (msg.equalsIgnoreCase("STOP")) {
       Serial.println("[TEST] Stopping vibration.");
       stopVibration();
     }
+    return; // Service timers and HTTP between complete serial commands.
   }
 }
 
 // ── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
   maintainWiFi();
-  server.handleClient();
-  handleUDPDiscovery();
   updateVibrationState();
   updateDispenserState();
   checkAlarms();
+  server.handleClient();
+  handleUDPDiscovery();
   handleSerialFromArduino();
 
   // Periodic heartbeat every 5 seconds so IP is always visible in Serial Monitor
